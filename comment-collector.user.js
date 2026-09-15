@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Comment Collector - 评论收藏增强
 // @namespace    comment-collector
-// @version      3.2.1
+// @version      3.2.2
 // @description  在 B站 / YouTube / X 收藏视频、推文与评论，B站额外显示 IP 属地与粉丝数
 // @author       biliip
 // @updateURL   https://raw.githubusercontent.com/0xlxx/comment-collector/main/comment-collector.user.js
@@ -1696,6 +1696,7 @@
     const FAV_MIRROR_STORE = 'mirror';           // keyPath: key（www 收藏的离线镜像）
     const FAV_HANDLE_STORE = 'handles';          // keyPath: key（离线副本目录句柄）
     const FAV_DB_VERSION = 4;
+    const FAV_DB_BLOCKED_BACKOFF = 20000;      // 被其它标签页占用时，多久内不再重试
     const OFFLINE_DIR_KEY = 'offline-dir';
     const OFFLINE_BUNDLE_NAME = 'comment-collector-offline';
     const FAV_ASSET_MAX_BYTES = 6 * 1024 * 1024;         // 单张图片上限
@@ -1722,6 +1723,7 @@
     let favoriteRecords = [];                    // 当前收藏缓存（面板渲染用）
     let favoriteCount = 0;                       // 收藏总数（FAB 角标用）
     let favDbPromise = null;
+    let favDbBlockedUntil = 0;                 // 数据库升级被占用时的退避截止时间
     let favPanelEl = null;
     let favSearchQuery = '';
     let favPanelOpener = null;
@@ -1746,29 +1748,68 @@
     }
 
     /** 打开（或创建）收藏数据库 */
+    function favDbBlockedError() {
+        const siteName = SITE === 'x' ? 'X' : (SITE === 'youtube' ? 'YouTube' : 'B站');
+        return new Error(`收藏数据库被其它 ${siteName} 标签页占用，请关闭其它标签页后重试`);
+    }
+
     function openFavDb() {
-        if (!favDbPromise) {
-            favDbPromise = new Promise((resolve, reject) => {
-                const req = indexedDB.open(FAV_DB_NAME, FAV_DB_VERSION);
-                req.onupgradeneeded = () => {
-                    const db = req.result;
-                    if (!db.objectStoreNames.contains(FAV_DB_STORE)) {
-                        db.createObjectStore(FAV_DB_STORE, { keyPath: 'id' });
-                    }
-                    if (!db.objectStoreNames.contains(FAV_ASSET_STORE)) {
-                        db.createObjectStore(FAV_ASSET_STORE, { keyPath: 'url' });
-                    }
-                    if (!db.objectStoreNames.contains(FAV_MIRROR_STORE)) {
-                        db.createObjectStore(FAV_MIRROR_STORE, { keyPath: 'key' });
-                    }
-                    if (!db.objectStoreNames.contains(FAV_HANDLE_STORE)) {
-                        db.createObjectStore(FAV_HANDLE_STORE, { keyPath: 'key' });
-                    }
+        // 升级被阻塞时 IndexedDB 并不会取消已发出的 open 请求：它会一直排队，
+        // 后续请求只能排在后面一起卡住（表现就是"收藏点了没反应"）。
+        // 因此进入退避窗口后直接快速失败，让 UI 能给出提示。
+        if (Date.now() < favDbBlockedUntil) return Promise.reject(favDbBlockedError());
+        if (favDbPromise) return favDbPromise;
+        favDbPromise = new Promise((resolve, reject) => {
+            const req = indexedDB.open(FAV_DB_NAME, FAV_DB_VERSION);
+            let abandoned = false;
+
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(FAV_DB_STORE)) {
+                    db.createObjectStore(FAV_DB_STORE, { keyPath: 'id' });
+                }
+                if (!db.objectStoreNames.contains(FAV_ASSET_STORE)) {
+                    db.createObjectStore(FAV_ASSET_STORE, { keyPath: 'url' });
+                }
+                if (!db.objectStoreNames.contains(FAV_MIRROR_STORE)) {
+                    db.createObjectStore(FAV_MIRROR_STORE, { keyPath: 'key' });
+                }
+                if (!db.objectStoreNames.contains(FAV_HANDLE_STORE)) {
+                    db.createObjectStore(FAV_HANDLE_STORE, { keyPath: 'key' });
+                }
+            };
+
+            req.onsuccess = () => {
+                const db = req.result;
+                // 其它标签页要升级数据库时主动让路：否则旧连接会把升级卡死，
+                // 表现就是"收藏点了没反应"。
+                db.onversionchange = () => {
+                    try { db.close(); } catch (_) { /* ignore */ }
+                    favDbPromise = null;
                 };
-                req.onsuccess = () => resolve(req.result);
-                req.onerror = () => reject(req.error);
-            });
-        }
+                if (abandoned) {
+                    // 之前已因阻塞放弃，请求现在才完成：关掉连接，别继续占用
+                    try { db.close(); } catch (_) { /* ignore */ }
+                    return;
+                }
+                resolve(db);
+            };
+
+            req.onerror = () => {
+                if (!abandoned) reject(req.error || new Error('IndexedDB 打开失败'));
+            };
+
+            // 升级被别的标签页挡住时，请求会无限等待。这里主动失败并给出可操作的提示，
+            // 而不是让收藏按钮一直转/一直禁用。
+            req.onblocked = () => {
+                abandoned = true;
+                favDbBlockedUntil = Date.now() + FAV_DB_BLOCKED_BACKOFF;
+                reject(favDbBlockedError());
+            };
+        }).catch((e) => {
+            favDbPromise = null;   // 允许之后重试（用户关掉旧标签页即可恢复）
+            throw e;
+        });
         return favDbPromise;
     }
 
@@ -3081,6 +3122,12 @@
         if (favoriteLoaded) return;
         await migrateLocalFavorites();
         await refreshFavoriteCache();
+        // 数据库不可用时收藏列表会读成空，这里主动提示，避免用户以为收藏丢了
+        openFavDb().catch((e) => {
+            const msg = String((e && e.message) || e);
+            if (/标签页/.test(msg)) showFavToast(msg);
+        });
+
         // 恢复离线副本目录句柄：同一浏览器会话内权限仍有效时，收藏即可自动写盘。
         // 另外在页面加载后补一次静默同步，覆盖"在动态页收藏、主站副本过期"的情况：
         // 内容没变化时只做一次签名比对，不写盘。
@@ -3823,7 +3870,10 @@ ${cards}
         el.textContent = msg;
         el.classList.add('be-show');
         clearTimeout(el._t);
-        el._t = setTimeout(() => el.classList.remove('be-show'), 2200);
+        // 需要用户动手处理的提示（关标签页 / 重新授权等）多留一会儿
+        const text = String(msg == null ? '' : msg);
+        const duration = /标签页|占用|权限/.test(text) ? 6000 : 2200;
+        el._t = setTimeout(() => el.classList.remove('be-show'), duration);
     }
 
     /** 带进度的常驻提示（长任务用，如打包离线页面） */
