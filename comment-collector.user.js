@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Comment Collector - 评论收藏增强
 // @namespace    comment-collector
-// @version      3.0.0
+// @version      3.1.0
 // @description  在 B站 / YouTube / X 收藏视频、推文与评论，B站额外显示 IP 属地与粉丝数
 // @author       biliip
 // @updateURL   https://raw.githubusercontent.com/0xlxx/comment-collector/main/comment-collector.user.js
@@ -706,6 +706,28 @@
                 text-align: center;
                 flex-shrink: 0;
             }
+            .be-fav-offline-pill {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                height: 22px;
+                padding: 0 8px;
+                border-radius: 11px;
+                background: var(--be-item-hover);
+                color: var(--be-text-secondary);
+                font-size: 11px;
+                font-weight: 600;
+                flex-shrink: 0;
+            }
+            .be-fav-offline-pill::before {
+                content: '';
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                background: currentColor;
+                opacity: .7;
+            }
+            .be-fav-offline-pill[hidden] { display: none; }
             .be-fav-header-actions {
                 display: flex;
                 align-items: center;
@@ -1615,8 +1637,14 @@
 
     const FAV_DB_NAME = 'bili-enhancer-fav';
     const FAV_DB_STORE = 'favorites';            // keyPath: id
+    const FAV_ASSET_STORE = 'assets';            // keyPath: url（封面 / 头像 Blob 缓存）
+    const FAV_MIRROR_STORE = 'mirror';           // keyPath: key（www 收藏的离线镜像）
+    const FAV_DB_VERSION = 3;
+    const FAV_ASSET_MAX_BYTES = 6 * 1024 * 1024;         // 单张图片上限
+    const FAV_ASSET_BUDGET_BYTES = 160 * 1024 * 1024;    // 资源缓存总量软上限
     const FAV_EXPORT_PREFIX = 'bilibili-favorites';
     const FAV_EXPORT_TYPES = [{ description: 'JSON 收藏文件', accept: { 'application/json': ['.json'] } }];
+    const FAV_OFFLINE_TYPES = [{ description: '离线收藏页面', accept: { 'text/html': ['.html'] } }];
 
     const FAV_ICONS = {
         bookmark: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5A2.5 2.5 0 0 1 8.5 2h7A2.5 2.5 0 0 1 18 4.5V21l-6-4-6 4z"/></svg>',
@@ -1626,6 +1654,7 @@
         trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m19 6-1 14H6L5 6"/><path d="M10 11v5"/><path d="M14 11v5"/></svg>',
         open: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg>',
         video: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9 5 3-5 3z"/></svg>',
+        offline: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 3 18 18"/><path d="M5.5 12.4A10 10 0 0 1 9 10.3"/><path d="M15.2 10.4A10 10 0 0 1 18.5 12.4"/><path d="M8.7 15.6a5 5 0 0 1 6.6 0"/><path d="M12 19.5h.01"/></svg>',
     };
 
     let favoriteIdSet = new Set();               // 本会话已知的已收藏 id
@@ -1660,11 +1689,17 @@
     function openFavDb() {
         if (!favDbPromise) {
             favDbPromise = new Promise((resolve, reject) => {
-                const req = indexedDB.open(FAV_DB_NAME, 2);
+                const req = indexedDB.open(FAV_DB_NAME, FAV_DB_VERSION);
                 req.onupgradeneeded = () => {
                     const db = req.result;
                     if (!db.objectStoreNames.contains(FAV_DB_STORE)) {
                         db.createObjectStore(FAV_DB_STORE, { keyPath: 'id' });
+                    }
+                    if (!db.objectStoreNames.contains(FAV_ASSET_STORE)) {
+                        db.createObjectStore(FAV_ASSET_STORE, { keyPath: 'url' });
+                    }
+                    if (!db.objectStoreNames.contains(FAV_MIRROR_STORE)) {
+                        db.createObjectStore(FAV_MIRROR_STORE, { keyPath: 'key' });
                     }
                 };
                 req.onsuccess = () => resolve(req.result);
@@ -1700,6 +1735,59 @@
         });
     }
 
+    // ── 离线镜像 ──
+    // 子域页面靠 www 的 iframe 桥接读取收藏，而 iframe 需要联网才能加载。
+    // 这里把最近一次成功同步的结果镜像到本地，供断网时兜底读取。
+
+    const FAV_MIRROR_KEY = 'favorites';
+
+    async function favMirrorWrite(records) {
+        if (!Array.isArray(records)) return;
+        try {
+            const db = await openFavDb();
+            await new Promise((resolve, reject) => {
+                const tx = db.transaction(FAV_MIRROR_STORE, 'readwrite');
+                tx.objectStore(FAV_MIRROR_STORE).put({
+                    key: FAV_MIRROR_KEY,
+                    records,
+                    saved_at: new Date().toISOString(),
+                });
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+                tx.onabort = () => reject(tx.error);
+            });
+        } catch (_) { /* ignore */ }
+    }
+
+    async function favMirrorRead() {
+        try {
+            const db = await openFavDb();
+            const rec = await new Promise((resolve, reject) => {
+                const tx = db.transaction(FAV_MIRROR_STORE, 'readonly');
+                const r = tx.objectStore(FAV_MIRROR_STORE).get(FAV_MIRROR_KEY);
+                r.onsuccess = () => resolve(r.result || null);
+                r.onerror = () => reject(r.error);
+            });
+            return rec && Array.isArray(rec.records) ? rec.records : [];
+        } catch (_) { return []; }
+    }
+
+    /** 离线镜像的乐观更新：离线增删后，本地视图立刻一致 */
+    async function favMirrorUpsert(record) {
+        const records = await favMirrorRead();
+        const next = records.filter(r => r && r.id !== record.id);
+        next.unshift(record);
+        await favMirrorWrite(next);
+    }
+
+    async function favMirrorRemove(id) {
+        const records = await favMirrorRead();
+        if (!records.length) return;
+        const next = records.filter(r => r && r.id !== id);
+        if (next.length === records.length) return;
+        await favMirrorWrite(next);
+    }
+
     /** 删除单条收藏记录 */
     async function favDeleteLocal(id) {
         const db = await openFavDb();
@@ -1710,6 +1798,224 @@
             tx.onerror = () => reject(tx.error);
             tx.onabort = () => reject(tx.error);
         });
+    }
+
+    // ── 本地资源缓存（封面 / 头像）──
+    // 图片以 Blob 存进 IndexedDB，断网时收藏面板仍能完整呈现内容。
+    // 不缓存视频文件本体：体量过大，离线页面保留封面、标题与原始链接。
+
+    const favAssetObjectUrls = new Map();   // 原始图片 URL → objectURL
+
+    /** 图片 URL 列表（封面、封面回退、头像） */
+    function recordAssetUrls(record) {
+        const urls = [];
+        if (!record) return urls;
+        const push = (raw) => {
+            const url = safeImageUrl(raw);
+            if (url && !urls.includes(url)) urls.push(url);
+        };
+        push(record.cover);
+        push(record.cover_fallback);
+        push(record.face);
+        return urls;
+    }
+
+    /** 已缓存资源的 objectURL，命中则直接返回，供渲染同步使用 */
+    function cachedAssetSrc(url) {
+        const key = safeImageUrl(url);
+        if (!key) return '';
+        return favAssetObjectUrls.get(key) || key;
+    }
+
+    async function favAssetGetLocal(url) {
+        try {
+            const db = await openFavDb();
+            return await new Promise((resolve, reject) => {
+                const tx = db.transaction(FAV_ASSET_STORE, 'readonly');
+                const r = tx.objectStore(FAV_ASSET_STORE).get(url);
+                r.onsuccess = () => resolve(r.result || null);
+                r.onerror = () => reject(r.error);
+            });
+        } catch (_) { return null; }
+    }
+
+    async function favAssetPutLocal(url, blob) {
+        const db = await openFavDb();
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction(FAV_ASSET_STORE, 'readwrite');
+            tx.objectStore(FAV_ASSET_STORE).put({
+                url,
+                blob,
+                size: blob.size || 0,
+                type: blob.type || '',
+                saved_at: new Date().toISOString(),
+            });
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error);
+        });
+    }
+
+    async function favAssetDeleteLocal(url) {
+        try {
+            const db = await openFavDb();
+            await new Promise((resolve, reject) => {
+                const tx = db.transaction(FAV_ASSET_STORE, 'readwrite');
+                tx.objectStore(FAV_ASSET_STORE).delete(url);
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+                tx.onabort = () => reject(tx.error);
+            });
+        } catch (_) { /* ignore */ }
+    }
+
+    /** 批量读取资源，返回 Map(原始 URL → Blob) */
+    async function favAssetGetManyLocal(urls) {
+        const found = new Map();
+        const keys = [...new Set((urls || []).filter(Boolean))];
+        if (!keys.length) return found;
+        try {
+            const db = await openFavDb();
+            await new Promise((resolve) => {
+                const tx = db.transaction(FAV_ASSET_STORE, 'readonly');
+                const store = tx.objectStore(FAV_ASSET_STORE);
+                keys.forEach((url) => {
+                    const r = store.get(url);
+                    r.onsuccess = () => {
+                        const rec = r.result;
+                        if (rec && rec.blob) found.set(url, rec.blob);
+                    };
+                });
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => resolve();
+                tx.onabort = () => resolve();
+            });
+        } catch (_) { /* ignore */ }
+        return found;
+    }
+
+    function registerFavAssetObjectUrl(url, blob) {
+        if (!url || !blob) return '';
+        const existing = favAssetObjectUrls.get(url);
+        if (existing) return existing;
+        try {
+            const objectUrl = URL.createObjectURL(blob);
+            favAssetObjectUrls.set(url, objectUrl);
+            return objectUrl;
+        } catch (_) { return ''; }
+    }
+
+    /** 把记录引用到的图片读进内存缓存，供面板同步渲染 */
+    async function hydrateFavoriteAssets(records) {
+        const pending = [];
+        const seen = new Set();
+        for (const record of records || []) {
+            for (const url of recordAssetUrls(record)) {
+                if (seen.has(url) || favAssetObjectUrls.has(url)) continue;
+                seen.add(url);
+                pending.push(url);
+            }
+        }
+        if (!pending.length) return;
+        const found = await favAssetGetManyLocal(pending);
+        found.forEach((blob, url) => registerFavAssetObjectUrl(url, blob));
+    }
+
+    /** 拉取一张图片并写入缓存；失败（离线 / 防盗链 / 超限）时静默跳过 */
+    async function cacheOneAsset(url) {
+        if (!url) return false;
+        if (favAssetObjectUrls.has(url)) return true;
+        try {
+            const res = await fetch(url, {
+                mode: 'cors',
+                credentials: 'omit',
+                referrerPolicy: 'no-referrer',
+                cache: 'force-cache',
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const blob = await res.blob();
+            if (!blob || !blob.size) throw new Error('empty');
+            if (blob.size > FAV_ASSET_MAX_BYTES) throw new Error('too large');
+            await favAssetPutLocal(url, blob);
+            registerFavAssetObjectUrl(url, blob);
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    /** 收藏时把封面 / 头像落盘，保证之后离线可看 */
+    async function cacheFavoriteAssets(record) {
+        const urls = recordAssetUrls(record);
+        if (!urls.length) return;
+        for (const url of urls) {
+            const cached = await favAssetGetLocal(url);
+            if (cached && cached.blob) {
+                registerFavAssetObjectUrl(url, cached.blob);
+                continue;
+            }
+            await cacheOneAsset(url);
+        }
+        await pruneFavAssets().catch(() => {});
+    }
+
+    /** 缓存超过软上限时按写入时间淘汰最旧的资源 */
+    async function pruneFavAssets() {
+        let db;
+        try { db = await openFavDb(); } catch (_) { return; }
+        const all = await new Promise((resolve) => {
+            try {
+                const tx = db.transaction(FAV_ASSET_STORE, 'readonly');
+                const r = tx.objectStore(FAV_ASSET_STORE).getAll();
+                r.onsuccess = () => resolve(r.result || []);
+                r.onerror = () => resolve([]);
+            } catch (_) { resolve([]); }
+        });
+        let total = all.reduce((sum, item) => sum + (item && item.size ? item.size : 0), 0);
+        if (total <= FAV_ASSET_BUDGET_BYTES) return;
+        const ordered = all.slice().sort((a, b) => toTimestamp(a.saved_at) - toTimestamp(b.saved_at));
+        for (const item of ordered) {
+            if (total <= FAV_ASSET_BUDGET_BYTES) break;
+            await favAssetDeleteLocal(item.url);
+            const objectUrl = favAssetObjectUrls.get(item.url);
+            if (objectUrl) {
+                try { URL.revokeObjectURL(objectUrl); } catch (_) { /* ignore */ }
+                favAssetObjectUrls.delete(item.url);
+            }
+            total -= item.size || 0;
+        }
+    }
+
+    /** 补齐旧收藏缺失的图片资源（打开面板时后台执行，限流避免打满网络） */
+    let favAssetBackfillRunning = false;
+    async function backfillFavoriteAssets(records) {
+        if (favAssetBackfillRunning) return;
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+        favAssetBackfillRunning = true;
+        try {
+            const missing = [];
+            const seen = new Set();
+            for (const record of records || []) {
+                for (const url of recordAssetUrls(record)) {
+                    if (seen.has(url) || favAssetObjectUrls.has(url)) continue;
+                    seen.add(url);
+                    missing.push(url);
+                }
+            }
+            if (!missing.length) return;
+
+            // 先批量命中本地缓存，只对真正缺失的资源发网络请求
+            const found = await favAssetGetManyLocal(missing);
+            found.forEach((blob, url) => registerFavAssetObjectUrl(url, blob));
+            for (const url of missing) {
+                if (found.has(url)) continue;
+                await cacheOneAsset(url);
+                await new Promise(r => setTimeout(r, 60));
+            }
+            await pruneFavAssets().catch(() => {});
+        } finally {
+            favAssetBackfillRunning = false;
+        }
     }
 
     function hasFsAccessApi() {
@@ -1907,13 +2213,23 @@
         });
     }
 
-    /** 读取全部收藏：B 站非 www 子域走桥接，其它站点使用本站 IndexedDB */
+    /**
+     * 读取全部收藏：B 站非 www 子域走桥接，其它站点使用本站 IndexedDB。
+     * 桥接不可用（断网 / iframe 加载失败）时回退到最近一次同步的本地镜像。
+     */
     async function favGetAll() {
         if (SITE === 'bilibili' && !isCanonicalFavOrigin()) {
             try {
-                return await favBridgeRequest('getAll');
+                const list = await favBridgeRequest('getAll');
+                favMirrorWrite(list).catch(() => {});
+                return list;
             } catch (e) {
                 favBridgeFailed = true;
+                const emptyMirror = await favMirrorRead();
+                if (emptyMirror.length) {
+                    console.warn('[评论增强] B 站跨页面同步不可用，已启用离线镜像');
+                    return emptyMirror;
+                }
                 console.warn('[评论增强] B 站跨页面收藏同步不可用，已回退本地存储：', e);
             }
         }
@@ -1927,11 +2243,13 @@
         if (SITE === 'bilibili' && !isCanonicalFavOrigin()) {
             try {
                 await favBridgeRequest('put', safeRecord);
+                favMirrorUpsert(safeRecord).catch(() => {});
                 return;
             } catch (e) {
                 favBridgeFailed = true;
                 console.warn('[评论增强] B 站跨页面收藏同步不可用，已回退本地存储：', e);
             }
+            await favMirrorUpsert(safeRecord).catch(() => {});
         }
         await favPutLocal(safeRecord);
     }
@@ -1943,11 +2261,13 @@
         if (SITE === 'bilibili' && !isCanonicalFavOrigin()) {
             try {
                 await favBridgeRequest('delete', { id: safeId });
+                favMirrorRemove(safeId).catch(() => {});
                 return;
             } catch (e) {
                 favBridgeFailed = true;
                 console.warn('[评论增强] B 站跨页面收藏同步不可用，已回退本地存储：', e);
             }
+            await favMirrorRemove(safeId).catch(() => {});
         }
         await favDeleteLocal(safeId);
     }
@@ -2222,6 +2542,24 @@
         return !!(overlay && (overlay.open || overlay.classList.contains('be-open')));
     }
 
+    function isOfflineNow() {
+        return typeof navigator !== 'undefined' && navigator.onLine === false;
+    }
+
+    /** 离线时在面板标题旁显示状态标记 */
+    function updateFavOfflineIndicator() {
+        const pill = document.getElementById('be-fav-offline-pill');
+        if (!pill) return;
+        if (isOfflineNow()) pill.removeAttribute('hidden');
+        else pill.setAttribute('hidden', '');
+    }
+
+    if (typeof window !== 'undefined' && !window.__beFavOfflineBound) {
+        window.__beFavOfflineBound = true;
+        window.addEventListener('online', updateFavOfflineIndicator);
+        window.addEventListener('offline', updateFavOfflineIndicator);
+    }
+
     /** 收藏 / 取消收藏一条评论（无感写入 IndexedDB） */
     async function toggleFavorite(data) {
         const id = commentUniqueId(data);
@@ -2239,6 +2577,7 @@
 
             const record = buildFavoriteRecord(data);
             await favPut(record);
+            cacheFavoriteAssets(record).catch(() => {});
             favoriteIdSet.add(id);
             favoriteRecords.unshift(record);
             favoriteCount = favoriteRecords.length;
@@ -2258,16 +2597,17 @@
     async function migrateLocalFavorites() {
         if (SITE !== 'bilibili' || isCanonicalFavOrigin()) return;
 
-        const migrationKey = 'be-fav-bridge-migrated-v1';
-        try {
-            if (localStorage.getItem(migrationKey)) return;
-        } catch (_) { /* localStorage 不可用时不阻塞 */ }
+        // 记录的是"上次已合并的本地 id 集合签名"，而不是布尔值：
+        // 这样断网期间在子域新收藏的内容，恢复网络后还会再合并一次。
+        const migrationKey = 'be-fav-bridge-migrated-v2';
 
         const local = await favGetAllLocal();
-        if (!local.length) {
-            try { localStorage.setItem(migrationKey, '1'); } catch (_) { /* ignore */ }
-            return;
-        }
+        if (!local.length) return;
+
+        const signature = simpleHash(local.map(r => (r && r.id) || '').sort().join('|'));
+        try {
+            if (localStorage.getItem(migrationKey) === signature) return;
+        } catch (_) { /* localStorage 不可用时不阻塞，重复合并按 id 幂等 */ }
 
         const canonical = await favGetAll();
         if (favBridgeFailed) return;
@@ -2277,10 +2617,11 @@
             if (record && record.id && !canonicalIds.has(record.id)) {
                 await favPut(record);
                 if (favBridgeFailed) return;
+                cacheFavoriteAssets(record).catch(() => {});
             }
         }
 
-        try { localStorage.setItem(migrationKey, '1'); } catch (_) { /* ignore */ }
+        try { localStorage.setItem(migrationKey, signature); } catch (_) { /* ignore */ }
     }
 
     /** 初始化：从 IndexedDB / 跨域桥接读取收藏缓存 */
@@ -2333,6 +2674,357 @@
         showFavToast('已导出：' + filename);
     }
 
+    // ── 离线快照 ──
+    // 油猴脚本依赖网站页面，断网时站点本身打不开，脚本自然不会运行。
+    // 因此这里把收藏导出成单文件 HTML：图片内联为 data URL，双击即可离线查看。
+
+    function blobToDataUrl(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ''));
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    /** 取图片的内联数据；优先本地缓存，其次在线抓取并顺手缓存 */
+    async function resolveAssetDataUrl(rawUrl) {
+        const url = safeImageUrl(rawUrl);
+        if (!url) return '';
+        let blob = null;
+        const cached = await favAssetGetLocal(url);
+        if (cached && cached.blob) {
+            blob = cached.blob;
+        } else {
+            try {
+                const res = await fetch(url, {
+                    mode: 'cors',
+                    credentials: 'omit',
+                    referrerPolicy: 'no-referrer',
+                    cache: 'force-cache',
+                });
+                if (res.ok) {
+                    const fetched = await res.blob();
+                    if (fetched && fetched.size && fetched.size <= FAV_ASSET_MAX_BYTES) {
+                        blob = fetched;
+                        await favAssetPutLocal(url, fetched);
+                        registerFavAssetObjectUrl(url, fetched);
+                    }
+                }
+            } catch (_) { /* 离线或防盗链 → 该图在快照中留空 */ }
+        }
+        if (!blob) return '';
+        try { return await blobToDataUrl(blob); } catch (_) { return ''; }
+    }
+
+    function offlineCardHtml(entry) {
+        const { record, coverData, faceData } = entry;
+        const isMedia = record.type === 'video' || record.type === 'post';
+        const site = record.site || 'bilibili';
+        const siteLabel = SITE_LABELS[site] || site;
+        const kindLabel = isMedia ? (record.type === 'post' ? '推文' : '视频') : '评论';
+        const uname = record.uname || '未知作者';
+        const initial = escapeHtml(Array.from(uname)[0] || '?');
+        const page = safeUrl(record.page) || safeUrl(normalizeRecordUrl(record));
+        const published = record.ctime ? formatDateTime(record.ctime * 1000) : (record.time_text || '未知时间');
+        const savedAt = formatRelativeTime(record.saved_at ? new Date(record.saved_at).getTime() : 0);
+        const duration = formatVideoDuration(record.duration);
+        const ipTag = record.ip ? `<span class="tag">IP ${escapeHtml(record.ip)}</span>` : '';
+        const searchBlob = escapeHtml([
+            uname, record.content || '', siteLabel, kindLabel, record.bvid || '', record.page || '',
+        ].join(' ').toLowerCase());
+
+        const avatar = faceData
+            ? `<img class="avatar" src="${faceData}" alt="">`
+            : `<span class="avatar avatar-fallback">${initial}</span>`;
+
+        let media = '';
+        if (isMedia) {
+            const cover = coverData
+                ? `<img class="cover" src="${coverData}" alt="">`
+                : `<span class="cover cover-fallback">${FAV_ICONS.video}</span>`;
+            media = `<div class="thumb">${cover}${duration ? `<span class="duration">${escapeHtml(duration)}</span>` : ''}</div>`;
+        }
+
+        // 媒体卡片用标题；评论卡片直接展示正文，避免同一段文字出现两次
+        const title = escapeHtml(record.content || ('未命名' + kindLabel));
+        const titleEl = !isMedia
+            ? ''
+            : (page
+                ? `<a class="title" href="${escapeHtml(page)}">${title}</a>`
+                : `<span class="title">${title}</span>`);
+        const body = isMedia
+            ? ''
+            : `<p class="body">${escapeHtml(record.content || '（无文字内容）')}</p>`;
+        const link = page
+            ? `<a class="open" href="${escapeHtml(page)}">打开原${kindLabel} ${FAV_ICONS.open}</a>`
+            : '';
+
+        return `<article class="card${isMedia ? ' card-media' : ''}" data-search="${searchBlob}">
+            <div class="card-head">${avatar}<div class="who"><span class="name">${escapeHtml(uname)}</span><div class="meta"><span class="tag">${escapeHtml(siteLabel)}</span><span class="tag">${kindLabel}</span>${ipTag}<span class="time">${escapeHtml(published)}</span></div></div></div>
+            <div class="card-body">${media}<div class="text">${titleEl}${body}</div></div>
+            <div class="card-foot"><span class="saved">收藏于 ${escapeHtml(savedAt)}</span>${link}</div>
+        </article>`;
+    }
+
+    function offlinePageHtml(entries, exportedAt) {
+        const cards = entries.map(offlineCardHtml).join('\n');
+        const total = entries.length;
+        return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="comment-collector">
+<meta name="exported-at" content="${escapeHtml(exportedAt)}">
+<title>我的收藏 · 离线副本</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg-a: #f5f6fa;
+  --bg-b: #e9ebf3;
+  --text: #16181d;
+  --text-2: #4b515c;
+  --text-3: #878d99;
+  --card: rgba(255,255,255,.72);
+  --card-border: rgba(255,255,255,.85);
+  --divider: rgba(16,18,24,.08);
+  --accent: #3b82f6;
+  --accent-soft: rgba(59,130,246,.12);
+  --shadow: rgba(16,18,24,.12);
+  --bar: rgba(255,255,255,.7);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-a: #0e1117;
+    --bg-b: #171b24;
+    --text: #f2f4f7;
+    --text-2: #c2c7d0;
+    --text-3: #868d99;
+    --card: rgba(30,35,45,.66);
+    --card-border: rgba(255,255,255,.08);
+    --divider: rgba(255,255,255,.09);
+    --accent: #60a5fa;
+    --accent-soft: rgba(96,165,250,.16);
+    --shadow: rgba(0,0,0,.5);
+    --bar: rgba(20,24,32,.72);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  padding: 0 0 64px;
+  font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  color: var(--text);
+  background: linear-gradient(160deg, var(--bg-a), var(--bg-b));
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+}
+.bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px max(20px, calc((100vw - 880px) / 2));
+  background: var(--bar);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--divider);
+}
+.bar h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: .2px; }
+.count {
+  min-width: 22px; height: 22px; padding: 0 7px;
+  border-radius: 11px; background: var(--accent-soft); color: var(--accent);
+  font-size: 11px; font-weight: 700; line-height: 22px; text-align: center;
+}
+.search {
+  margin-left: auto;
+  width: min(240px, 40vw);
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 10px;
+  border: 1px solid var(--divider);
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+  transition: border-color .2s ease, box-shadow .2s ease;
+}
+.search::placeholder { color: var(--text-3); }
+.search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.list {
+  padding: 20px max(20px, calc((100vw - 880px) / 2)) 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.card {
+  padding: 14px 16px;
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+  background: var(--card);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  box-shadow: 0 6px 24px var(--shadow);
+  transition: transform .2s ease, box-shadow .2s ease;
+}
+.card:hover { transform: translateY(-1px); box-shadow: 0 10px 32px var(--shadow); }
+.card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.avatar {
+  width: 34px; height: 34px; border-radius: 50%; object-fit: cover; flex-shrink: 0;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 55%, #8b5cf6), var(--accent));
+}
+.avatar-fallback {
+  display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 13px; font-weight: 700;
+}
+.who { min-width: 0; flex: 1; }
+.name { display: block; font-size: 13px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 3px; font-size: 11px; color: var(--text-3); }
+.tag {
+  display: inline-flex; align-items: center; height: 18px; padding: 0 6px;
+  border-radius: 6px; background: var(--accent-soft); color: var(--accent); font-size: 10px; font-weight: 600;
+}
+.time { font-size: 11px; color: var(--text-3); }
+.card-body { display: flex; gap: 12px; }
+.card-media .card-body { align-items: center; }
+.thumb {
+  position: relative; flex-shrink: 0;
+  width: 168px; aspect-ratio: 16 / 9;
+  border-radius: 10px; overflow: hidden;
+  background: color-mix(in srgb, var(--text-3) 18%, transparent);
+}
+.cover { width: 100%; height: 100%; object-fit: cover; display: block; }
+.cover-fallback { display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+.cover-fallback svg { width: 26px; height: 26px; fill: none; stroke: currentColor; stroke-width: 1.8; }
+.duration {
+  position: absolute; right: 6px; bottom: 6px;
+  padding: 1px 5px; border-radius: 5px;
+  background: rgba(0,0,0,.66); color: #fff; font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.text { min-width: 0; flex: 1; }
+.title {
+  display: block; font-size: 13.5px; font-weight: 600; line-height: 1.5; color: var(--text);
+  text-decoration: none; overflow-wrap: anywhere;
+}
+a.title:hover { color: var(--accent); }
+.body { margin: 0; max-width: 78ch; font-size: 13px; line-height: 1.65; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.card-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--divider);
+  font-size: 11px; color: var(--text-3);
+}
+.open { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); text-decoration: none; font-weight: 600; }
+.open svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.empty { padding: 80px 20px; text-align: center; color: var(--text-3); }
+@media (max-width: 620px) {
+  .card-media .card-body { flex-direction: column; }
+  .thumb { width: 100%; }
+}
+</style>
+</head>
+<body>
+<header class="bar">
+  <h1>我的收藏</h1>
+  <span class="count" id="count">${total}</span>
+  <input class="search" id="search" type="search" placeholder="搜索收藏…" autocomplete="off">
+</header>
+<main class="list" id="list">
+${cards}
+</main>
+<script>
+(function () {
+  var input = document.getElementById('search');
+  var cards = [].slice.call(document.querySelectorAll('.card'));
+  var countEl = document.getElementById('count');
+  var list = document.getElementById('list');
+  var empty = document.createElement('div');
+  empty.className = 'empty';
+  empty.textContent = '没有匹配的收藏';
+  input.addEventListener('input', function () {
+    var q = input.value.trim().toLowerCase();
+    var visible = 0;
+    cards.forEach(function (card) {
+      var hit = !q || (card.dataset.search || '').indexOf(q) > -1;
+      card.style.display = hit ? '' : 'none';
+      if (hit) visible += 1;
+    });
+    countEl.textContent = String(visible);
+    if (!visible && !empty.parentNode) list.appendChild(empty);
+    if (visible && empty.parentNode) empty.remove();
+  });
+})();
+</script>
+</body>
+</html>`;
+    }
+
+    /** 导出离线快照：单文件 HTML，无网络也能完整查看收藏内容 */
+    async function exportOfflineSnapshot() {
+        const list = await favGetAll();
+        if (!list.length) {
+            showFavToast('暂无收藏可导出');
+            return;
+        }
+        const sorted = list.slice().sort((a, b) => toTimestamp(b.saved_at) - toTimestamp(a.saved_at));
+        const toast = showFavProgress('正在打包离线内容…');
+        try {
+            const entries = [];
+            for (let i = 0; i < sorted.length; i++) {
+                const record = sorted[i];
+                const isMedia = record.type === 'video' || record.type === 'post';
+                const [coverData, faceData] = await Promise.all([
+                    isMedia ? resolveAssetDataUrl(record.cover || record.cover_fallback) : Promise.resolve(''),
+                    resolveAssetDataUrl(record.face),
+                ]);
+                entries.push({ record, coverData, faceData });
+                toast.update(`正在打包离线内容… ${i + 1}/${sorted.length}`);
+            }
+
+            const d = new Date();
+            const pad = n => String(n).padStart(2, '0');
+            const prefix = SITE === 'youtube' ? 'youtube-favorites' : (SITE === 'x' ? 'x-favorites' : FAV_EXPORT_PREFIX);
+            const filename = `${prefix}-offline-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.html`;
+            const html = offlinePageHtml(entries, d.toISOString());
+
+            let saved = false;
+            if (hasFsAccessApi()) {
+                try {
+                    const handle = await window.showSaveFilePicker({
+                        suggestedName: filename,
+                        types: FAV_OFFLINE_TYPES,
+                    });
+                    const writable = await handle.createWritable();
+                    await writable.write(html);
+                    await writable.close();
+                    saved = true;
+                    toast.done('已导出离线页面：' + handle.name);
+                } catch (e) {
+                    if (e && e.name === 'AbortError') { toast.close(); return; }
+                }
+            }
+            if (!saved) {
+                const blob = new Blob([html], { type: 'text/html' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+                toast.done('已导出离线页面：' + filename);
+            }
+        } catch (e) {
+            toast.close();
+            showFavToast('导出失败：' + ((e && e.message) || e));
+        }
+    }
+
     /** 收藏管理面板（查看 / 搜索 / 打开 / 删除） */
     function ensureFavPanel() {
         if (favPanelEl) return favPanelEl;
@@ -2349,10 +3041,12 @@
                             <h2 class="be-fav-title" id="be-fav-title-text">我的收藏</h2>
                         </div>
                         <span class="be-fav-count-pill" id="be-fav-count-pill">0</span>
+                        <span class="be-fav-offline-pill" id="be-fav-offline-pill" title="当前离线，收藏内容来自本地缓存" hidden>离线</span>
                     </div>
                     <div class="be-fav-header-actions">
-                        <button type="button" class="be-icon-btn" id="be-fav-export" title="导出收藏">${FAV_ICONS.download}</button>
-                        <button type="button" class="be-icon-btn" id="be-fav-close" title="关闭">${FAV_ICONS.close}</button>
+                        <button type="button" class="be-icon-btn" id="be-fav-offline" title="导出离线页面（无网络也能查看）" aria-label="导出离线页面">${FAV_ICONS.offline}</button>
+                        <button type="button" class="be-icon-btn" id="be-fav-export" title="导出 JSON 备份" aria-label="导出 JSON 备份">${FAV_ICONS.download}</button>
+                        <button type="button" class="be-icon-btn" id="be-fav-close" title="关闭" aria-label="关闭">${FAV_ICONS.close}</button>
                     </div>
                 </div>
                 <div class="be-fav-toolbar">
@@ -2371,6 +3065,9 @@
         overlay.querySelector('#be-fav-close').addEventListener('click', closeFavPanel);
         overlay.querySelector('#be-fav-export').addEventListener('click', () => {
             exportFavorites().catch(e => showFavToast('导出失败：' + ((e && e.message) || e)));
+        });
+        overlay.querySelector('#be-fav-offline').addEventListener('click', () => {
+            exportOfflineSnapshot();
         });
         const searchInput = overlay.querySelector('#be-fav-search');
         searchInput.addEventListener('input', () => {
@@ -2396,6 +3093,7 @@
             if (e.key === 'Escape' && isFavPanelOpen()) closeFavPanel();
         });
 
+        updateFavOfflineIndicator();
         favPanelEl = overlay;
         return overlay;
     }
@@ -2418,13 +3116,19 @@
         const fabWrap = document.getElementById('be-fab-wrap');
         if (fabWrap) fabWrap.classList.add('be-favorites-open');
 
+        updateFavOfflineIndicator();
+
         if (!favoriteLoaded) {
             const listEl = overlay.querySelector('#be-fav-list');
             setHtml(listEl, '<div class="be-fav-empty"><div class="be-fav-empty-title">正在加载收藏…</div></div>');
         }
 
         await refreshFavoriteCache();
+        await hydrateFavoriteAssets(favoriteRecords);
         renderFavoritesList();
+        backfillFavoriteAssets(favoriteRecords)
+            .then(() => { if (isFavPanelOpen()) renderFavoritesList(); })
+            .catch(() => {});
         setTimeout(() => {
             if (!isFavPanelOpen()) return;
             const search = overlay.querySelector('#be-fav-search');
@@ -2472,8 +3176,8 @@
         const title = record.content || ('未命名' + kindLabel);
         const uname = record.uname || ('未知' + authorLabel);
         const page = safeUrl(record.page);
-        const cover = safeImageUrl(record.cover);
-        const coverFallback = safeImageUrl(record.cover_fallback);
+        const cover = cachedAssetSrc(record.cover);
+        const coverFallback = record.cover_fallback ? cachedAssetSrc(record.cover_fallback) : '';
         const duration = formatVideoDuration(record.duration);
         const publishedAt = record.ctime ? formatDateTime(record.ctime * 1000) : (record.time_text || '未知时间');
         const savedAt = formatRelativeTime(record.saved_at ? new Date(record.saved_at).getTime() : 0);
@@ -2525,7 +3229,7 @@
         const uname = record.uname || '匿名用户';
         const initial = escapeHtml(Array.from(uname)[0] || '?');
         const content = escapeHtml(record.content || '（无文字内容）');
-        const avatarUrl = safeImageUrl(record.face);
+        const avatarUrl = record.face ? cachedAssetSrc(record.face) : '';
         const ctime = record.ctime ? formatDateTime(record.ctime * 1000) : (record.time_text || '未知时间');
         const savedAt = formatRelativeTime(record.saved_at ? new Date(record.saved_at).getTime() : 0);
         const page = safeUrl(normalizeRecordUrl(record));
@@ -2644,17 +3348,41 @@
     }
 
     /** 轻量提示条 */
-    function showFavToast(msg) {
+    function ensureFavToastEl() {
         let el = document.getElementById('be-fav-toast');
         if (!el) {
             el = document.createElement('div');
             el.id = 'be-fav-toast';
             document.body.appendChild(el);
         }
+        return el;
+    }
+
+    function showFavToast(msg) {
+        const el = ensureFavToastEl();
         el.textContent = msg;
         el.classList.add('be-show');
         clearTimeout(el._t);
         el._t = setTimeout(() => el.classList.remove('be-show'), 2200);
+    }
+
+    /** 带进度的常驻提示（长任务用，如打包离线页面） */
+    function showFavProgress(initial) {
+        const el = ensureFavToastEl();
+        clearTimeout(el._t);
+        el.textContent = initial || '';
+        el.classList.add('be-show');
+        const finish = (msg) => {
+            el.textContent = msg;
+            el.classList.add('be-show');
+            clearTimeout(el._t);
+            el._t = setTimeout(() => el.classList.remove('be-show'), 2600);
+        };
+        return {
+            update(msg) { el.textContent = msg; el.classList.add('be-show'); },
+            done: finish,
+            close() { clearTimeout(el._t); el.classList.remove('be-show'); },
+        };
     }
 
     function addFavoriteButton(root, data, replyControlRoot) {
@@ -2811,6 +3539,7 @@
             }
 
             await favPut(record);
+            cacheFavoriteAssets(record).catch(() => {});
             favoriteIdSet.add(record.id);
             favoriteRecords = favoriteRecords.filter(r => r && r.id !== record.id);
             favoriteRecords.unshift(record);
