@@ -1,32 +1,45 @@
-# Bilibili 评论增强 - IP 属地 & 粉丝数
+# Comment Collector - B站 / YouTube / X
 
-一个油猴（UserScript）脚本，在 B 站评论区为每条评论显示 **IP 属地** 和 **粉丝数量**，支持独立开关与深浅色主题自适应。
+一个油猴（UserScript）脚本：在 B 站显示评论 IP 属地与粉丝数，并在 **B站 / YouTube / X** 上收藏视频、推文与评论，统一通过悬浮球和收藏面板查看。
 
 ## 功能
 
+### B 站增强
 - **IP 属地**：显示评论者 IP 属地（从评论组件内部数据提取）
 - **粉丝数量**：通过 B 站公开接口实时获取，按量级分级配色
   - 格式：`128粉丝` / `1.2k粉丝` / `1.2w粉丝`
   - 配色：蓝灰 → 中蓝 → 琥珀 → 珊瑚红 → 金
-- **评论收藏**：每条评论操作栏新增收藏按钮，收藏数据**无感保存**到浏览器本地（IndexedDB），支持取消收藏、按评论 ID 去重；设置面板可**查看收藏列表**（打开原评论 / 单条删除）并**导出**为 JSON 文件
-- **独立开关**：右下角浮动设置按钮，可分别开启/关闭 IP 属地 / 粉丝数量 / 评论收藏，设置持久化到 `localStorage`
-- **页面覆盖**：视频页 `/video/`、个人空间 `/space/`、动态页 `t.bilibili.com`、`/opus/`、稍后再看 `/list/watchlater`
-- **主题自适应**：深色 / 浅色切换时自动重染颜色
-- **性能优化**：粉丝数 10 分钟缓存，并发请求去重
+
+### 多站点收藏
+- **B站**：收藏视频（工具栏按钮 / 悬浮菜单）和评论；跨 `www` / `t` / `space` / `search` 子域同步
+- **YouTube**：收藏视频（操作栏按钮 / 悬浮菜单）和评论
+- **X / Twitter**：收藏推文 / 回复（每条推文操作栏按钮，收藏页推文可从悬浮菜单）
+- **悬浮球**：右下角悬浮球可拖拽；靠近左右边缘自动半隐藏，hover 展开菜单；位置持久化到 `localStorage`
+- **收藏面板**：毛玻璃 UI，支持搜索、混合展示视频卡片与评论记录、打开原内容、单条删除、导出 JSON
+- **主题自适应**：深色 / 浅色自动切换毛玻璃配色
+
+### 站点支持
+- Bilibili：`www.bilibili.com`、`t.bilibili.com`、`space.bilibili.com`、`search.bilibili.com`
+- YouTube：`www.youtube.com`、`m.youtube.com`
+- X：`x.com`、`twitter.com`
 
 ## 安装
 
 1. 安装油猴插件（Tampermonkey / Violentmonkey）
-2. 将 `bilibili-ips.user.js` 导入为新建脚本（或安装 `.user.js` 直链）
-3. 打开任意 B 站视频 / 空间 / 动态页面即可看到效果
+2. 将 `comment-collector.user.js` 导入为新建脚本（或安装 `.user.js` 直链）
+3. 打开 B 站 / YouTube / X 页面即可看到悬浮球
 
 ## 技术要点
 
 - 纯前端，`@grant none`，`document-end` 注入
-- 深度遍历 B 站评论区 Shadow DOM，使用 `MutationObserver` 监听动态加载
-- 通过 CSS 自定义属性穿透 Shadow DOM 控制 badge 显隐，`inline style` 绕过样式隔离
-- 收藏数据存入 IndexedDB（keyPath=id），点击即无感保存，不打断浏览；导出优先用 File System Access API 弹窗保存，不支持时降级为浏览器下载
-- 模块化组织：配置、数据提取、API 缓存、格式化、样式注入、渲染、评论收藏、设置面板、入口编排
+- **站点适配层**：B站走 Shadow DOM 评论区；YouTube 走 `ytd-comment-*` / `#top-level-buttons-computed`；X 走 `article[data-testid="tweet"]` 与 `[role="group"]`
+- **存储**：每个站点使用各自 origin 的 IndexedDB（keyPath=id），记录带 `site` / `type` 字段
+  - B 站子域之间通过隐藏的 `www.bilibili.com/404` iframe + `postMessage` 桥接共享同一份收藏
+  - YouTube / X 目前为站点独立收藏夹；跨站统一收藏需要改用油猴 `GM_setValue` 存储
+- 悬浮球使用 Pointer Events 拖拽、边缘吸附与半隐藏
+- 收藏面板使用原生 `<dialog>.showModal()` 进入 top layer，避免页面 `transform` 影响定位
+- 收藏内容渲染前统一 HTML 转义与 URL 协议校验
+- 导出优先用 File System Access API，降级为浏览器下载
 
 ## License
 
