@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Comment Collector - 评论收藏增强
 // @namespace    comment-collector
-// @version      3.2.3
-// @description  在 B站 / YouTube / X 收藏视频、推文与评论，B站额外显示 IP 属地与粉丝数
+// @version      3.3.0
+// @description  在 B站 / YouTube / X 收藏视频、推文与评论，跨站统一搜索；B站额外显示 IP 属地与粉丝数
 // @author       biliip
 // @updateURL   https://raw.githubusercontent.com/0xlxx/comment-collector/main/comment-collector.user.js
 // @downloadURL https://raw.githubusercontent.com/0xlxx/comment-collector/main/comment-collector.user.js
@@ -12,7 +12,10 @@
 // @match        https://youtube.com/*
 // @match        https://x.com/*
 // @match        https://twitter.com/*
-// @grant        none
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        unsafeWindow
 // @run-at       document-end
 // ==/UserScript==
 
@@ -41,16 +44,10 @@
         watchLater: 'https://www.bilibili.com/list/watchlater',
     };
 
-    /**
-     * 需要注入浮窗 UI 的主站页面。
-     * 与评论区增强解耦：即使当前页面没有评论，也能打开收藏面板。
-     */
-    const UI_HOSTS = new Set([
-        'www.bilibili.com',
-        't.bilibili.com',
-        'space.bilibili.com',
-        'search.bilibili.com',
-    ]);
+    /** B 站任意子域都算主站页面（收藏数据通过桥接共享） */
+    function isBilibiliHost(host) {
+        return host === 'bilibili.com' || host.endsWith('.bilibili.com');
+    }
 
     /** 当前站点：bilibili / youtube / x */
     const SITE = (() => {
@@ -71,13 +68,22 @@
      * YouTube 等站点启用了 require-trusted-types-for 'script'。
      * 用独立策略包装扩展自身的 innerHTML，避免破坏页面原有策略。
      */
+    /** 页面 window（GM 沙箱下优先取真实页面 window） */
+    function pageWindow() {
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow;
+        } catch (_) { /* ignore */ }
+        return window;
+    }
+
     let beTrustedHtmlPolicy = null;
     function getTrustedHtmlPolicy() {
         if (beTrustedHtmlPolicy) return beTrustedHtmlPolicy;
         try {
-            if (window.trustedTypes && window.trustedTypes.createPolicy) {
+            const pw = pageWindow();
+            if (pw.trustedTypes && pw.trustedTypes.createPolicy) {
                 const name = 'be-enhancer-' + Math.random().toString(36).slice(2);
-                beTrustedHtmlPolicy = window.trustedTypes.createPolicy(name, {
+                beTrustedHtmlPolicy = pw.trustedTypes.createPolicy(name, {
                     createHTML: (html) => html,
                 });
             }
@@ -1280,7 +1286,8 @@
      */
     function shouldInjectUI() {
         if (window.top !== window.self) return false; // 不在 iframe 内重复注入
-        if (SITE === 'bilibili') return UI_HOSTS.has(window.location.hostname);
+        // B 站全子域放开：任意页面（含 passport / message / live 等）都能打开收藏夹
+        if (SITE === 'bilibili') return isBilibiliHost(window.location.hostname);
         return SITE === 'youtube' || SITE === 'x';
     }
 
@@ -1720,7 +1727,8 @@
 
     let favoriteIdSet = new Set();               // 本会话已知的已收藏 id
     let favoriteLoaded = false;                  // 是否已从 IndexedDB 初始化
-    let favoriteRecords = [];                    // 当前收藏缓存（面板渲染用）
+    let favoriteRecords = [];                    // 面板渲染用（跨站合并后的全部收藏）
+    let favoriteLocalRecords = [];               // 仅当前站点（增删改以它为准）
     let favoriteCount = 0;                       // 收藏总数（FAB 角标用）
     let favDbPromise = null;
     let favDbBlockedUntil = 0;                 // 数据库升级被占用时的退避截止时间
@@ -1906,8 +1914,15 @@
     let offlineLastSyncAt = 0;
     let offlineLastError = '';
 
+    function getDirectoryPicker() {
+        const pw = pageWindow();
+        try { if (typeof pw.showDirectoryPicker === 'function') return pw.showDirectoryPicker.bind(pw); } catch (_) { /* ignore */ }
+        try { if (typeof window.showDirectoryPicker === 'function') return window.showDirectoryPicker.bind(window); } catch (_) { /* ignore */ }
+        return null;
+    }
+
     function supportsOfflineDir() {
-        return typeof window.showDirectoryPicker === 'function';
+        return !!getDirectoryPicker();
     }
 
     async function offlineDirGetStored() {
@@ -2085,7 +2100,7 @@
         offlineSyncRunning = true;
         const toast = opts.toast !== false ? showFavProgress('正在同步离线副本…') : null;
         try {
-            const list = await favGetAll();
+            const list = await collectCrossSiteRecords(await favGetAll());
             const sorted = list.slice().sort((a, b) => toTimestamp(b.saved_at) - toTimestamp(a.saved_at));
             const root = await handle.getDirectoryHandle(OFFLINE_BUNDLE_NAME, { create: true });
 
@@ -2164,9 +2179,11 @@
     /** 选择离线副本目录（需要用户手势），并把当前收藏写入其中 */
     async function configureOfflineDir() {
         if (!supportsOfflineDir()) return { ok: false, reason: 'unsupported' };
+        const pickDirectory = getDirectoryPicker();
+        if (!pickDirectory) return { ok: false, reason: 'unsupported' };
         let handle;
         try {
-            handle = await window.showDirectoryPicker({
+            handle = await pickDirectory({
                 id: 'comment-collector-offline',
                 mode: 'readwrite',
                 startIn: 'desktop',
@@ -2487,8 +2504,15 @@
         }
     }
 
+    function getSaveFilePicker() {
+        const pw = pageWindow();
+        try { if (typeof pw.showSaveFilePicker === 'function') return pw.showSaveFilePicker.bind(pw); } catch (_) { /* ignore */ }
+        try { if (typeof window.showSaveFilePicker === 'function') return window.showSaveFilePicker.bind(window); } catch (_) { /* ignore */ }
+        return null;
+    }
+
     function hasFsAccessApi() {
-        return typeof window.showSaveFilePicker === 'function';
+        return !!getSaveFilePicker();
     }
 
 
@@ -2500,12 +2524,13 @@
     const FAV_BRIDGE_URL = FAV_BRIDGE_ORIGIN + '/404?be_fav_bridge=1';
     const FAV_BRIDGE_PARAM = 'be_fav_bridge';
     const FAV_BRIDGE_TIMEOUT = 6000;
-    const FAV_BRIDGE_ALLOWED_ORIGINS = new Set([
-        'https://www.bilibili.com',
-        'https://t.bilibili.com',
-        'https://space.bilibili.com',
-        'https://search.bilibili.com',
-    ]);
+    /** 任意 bilibili 子域都允许通过桥接读写主库 */
+    function isBilibiliOrigin(origin) {
+        try {
+            const host = new URL(origin).hostname;
+            return host === 'bilibili.com' || host.endsWith('.bilibili.com');
+        } catch (_) { return false; }
+    }
 
     let favBridgeFrame = null;
     let favBridgeReadyPromise = null;
@@ -2564,7 +2589,7 @@
         };
 
         window.addEventListener('message', async (event) => {
-            if (!FAV_BRIDGE_ALLOWED_ORIGINS.has(event.origin)) return;
+            if (!isBilibiliOrigin(event.origin)) return;
             if (event.source !== window.parent) return;
             const data = event.data;
             if (!data || data.type !== 'be-fav-bridge-request' || typeof data.id !== 'string') return;
@@ -2739,6 +2764,146 @@
             await favMirrorRemove(safeId).catch(() => {});
         }
         await favDeleteLocal(safeId);
+    }
+
+    // ── 跨站收藏索引 ──
+    // IndexedDB 按 origin 隔离（B站 / YouTube / X 各存一份），单站面板看不到别的站点。
+    // 这里额外维护一份跨站索引（油猴存储，所有站点共享），让任意站点都能搜索全部收藏。
+    // 索引只存文本记录；图片仍留在各 origin 的 IndexedDB 里，本站优先用本地缓存。
+
+    const CROSS_INDEX_KEY = 'be-cross-index-v1';
+    const CROSS_MAX_RECORDS = 4000;
+    const CROSS_MAX_TOMBSTONES = 800;
+
+    /** 是否具备跨站存储能力（未授权 GM 存储时自动降级为单站模式） */
+    function hasCrossStorage() {
+        try {
+            if (typeof GM_getValue === 'function' && typeof GM_setValue === 'function') return true;
+            return typeof GM !== 'undefined' && GM && typeof GM.getValue === 'function' && typeof GM.setValue === 'function';
+        } catch (_) { return false; }
+    }
+
+    function gmGetRaw(key) {
+        return new Promise((resolve) => {
+            try {
+                if (typeof GM_getValue === 'function') {
+                    const v = GM_getValue(key, null);
+                    if (v && typeof v.then === 'function') { v.then(resolve, () => resolve(null)); return; }
+                    resolve(v == null ? null : v);
+                    return;
+                }
+                if (typeof GM !== 'undefined' && GM && typeof GM.getValue === 'function') {
+                    GM.getValue(key, null).then(resolve, () => resolve(null));
+                    return;
+                }
+            } catch (_) { /* ignore */ }
+            resolve(null);
+        });
+    }
+
+    function gmSetRaw(key, value) {
+        return new Promise((resolve) => {
+            try {
+                if (typeof GM_setValue === 'function') {
+                    const r = GM_setValue(key, value);
+                    if (r && typeof r.then === 'function') { r.then(() => resolve(true), () => resolve(false)); return; }
+                    resolve(true);
+                    return;
+                }
+                if (typeof GM !== 'undefined' && GM && typeof GM.setValue === 'function') {
+                    GM.setValue(key, value).then(() => resolve(true), () => resolve(false));
+                    return;
+                }
+            } catch (_) { /* ignore */ }
+            resolve(false);
+        });
+    }
+
+    /** 跨站唯一键：不同站点可能出现相同 id，必须带站点前缀 */
+    function recordGlobalKey(record) {
+        if (!record || !record.id) return '';
+        return (record.site || 'bilibili') + '::' + record.id;
+    }
+
+    async function crossIndexRead() {
+        const empty = { records: [], tombstones: [] };
+        if (!hasCrossStorage()) return empty;
+        const raw = await gmGetRaw(CROSS_INDEX_KEY);
+        if (!raw) return empty;
+        try {
+            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            return {
+                records: Array.isArray(parsed && parsed.records) ? parsed.records.filter(r => r && r.id) : [],
+                tombstones: Array.isArray(parsed && parsed.tombstones) ? parsed.tombstones.filter(t => t && t.key) : [],
+            };
+        } catch (_) { return empty; }
+    }
+
+    async function crossIndexWrite(data) {
+        if (!hasCrossStorage()) return false;
+        const payload = {
+            records: (data.records || []).slice(0, CROSS_MAX_RECORDS),
+            tombstones: (data.tombstones || []).slice(-CROSS_MAX_TOMBSTONES),
+            updated_at: new Date().toISOString(),
+        };
+        return gmSetRaw(CROSS_INDEX_KEY, JSON.stringify(payload));
+    }
+
+    /** 写入 / 更新一条（同时清掉同键墓碑，表示这条被重新收藏了） */
+    async function crossIndexUpsert(record) {
+        if (!hasCrossStorage() || !record || !record.id) return;
+        const key = recordGlobalKey(record);
+        const data = await crossIndexRead();
+        data.records = data.records.filter(r => recordGlobalKey(r) !== key);
+        data.records.unshift(record);
+        data.tombstones = data.tombstones.filter(t => t.key !== key);
+        await crossIndexWrite(data);
+    }
+
+    /** 从索引移除并留墓碑：否则该项会在对应站点下次同步时又冒出来 */
+    async function crossIndexRemove(record) {
+        const key = recordGlobalKey(record);
+        if (!hasCrossStorage() || !key) return;
+        const data = await crossIndexRead();
+        data.records = data.records.filter(r => recordGlobalKey(r) !== key);
+        data.tombstones = data.tombstones.filter(t => t.key !== key);
+        data.tombstones.push({ key, deletedAt: Date.now() });
+        await crossIndexWrite(data);
+    }
+
+    /**
+     * 合并本站 + 跨站索引，返回面板展示用的完整列表。
+     * 本站数据优先（更完整），被删除过的（墓碑）一律排除。
+     */
+    async function collectCrossSiteRecords(localRecords) {
+        const local = (localRecords || []).filter(r => r && r.id);
+        if (!hasCrossStorage()) return local.slice();
+
+        const data = await crossIndexRead();
+        const dead = new Set(data.tombstones.map(t => t.key));
+        const map = new Map();
+        for (const r of data.records) {
+            const key = recordGlobalKey(r);
+            if (!key || dead.has(key)) continue;
+            map.set(key, r);
+        }
+        for (const r of local) {
+            const key = recordGlobalKey(r);
+            if (!key || dead.has(key)) continue;
+            map.set(key, r);
+        }
+
+        // 升级到跨站版后首次运行：把本站已有收藏补进索引
+        const known = new Set(data.records.map(r => recordGlobalKey(r)));
+        const missing = local.filter(r => {
+            const key = recordGlobalKey(r);
+            return key && !known.has(key) && !dead.has(key);
+        });
+        if (missing.length) {
+            crossIndexWrite({ records: [...missing, ...data.records], tombstones: data.tombstones }).catch(() => {});
+        }
+
+        return [...map.values()];
     }
 
     /** HTML 转义，避免收藏内容 / 用户名注入 */
@@ -2968,12 +3133,17 @@
     async function refreshFavoriteCache() {
         try {
             const list = await favGetAll();
-            favoriteRecords = list
+            favoriteLocalRecords = list
                 .filter(r => r && r.id)
                 .sort((a, b) => toTimestamp(b.saved_at) - toTimestamp(a.saved_at));
-            favoriteIdSet = new Set(favoriteRecords.map(r => r.id));
+            // 按钮状态只看本站，避免不同站点恰好同 id 时互相干扰
+            favoriteIdSet = new Set(favoriteLocalRecords.map(r => r.id));
+            // 面板展示跨站合并后的全部收藏
+            favoriteRecords = await collectCrossSiteRecords(favoriteLocalRecords);
+            favoriteRecords.sort((a, b) => toTimestamp(b.saved_at) - toTimestamp(a.saved_at));
             favoriteCount = favoriteRecords.length;
         } catch (_) {
+            favoriteLocalRecords = [];
             favoriteRecords = [];
             favoriteIdSet = new Set();
             favoriteCount = 0;
@@ -3056,9 +3226,16 @@
         const id = commentUniqueId(data);
         try {
             if (favoriteIdSet.has(id)) {
+                const removed = favoriteLocalRecords.find(r => r && r.id === id);
                 await favDelete(id);
                 favoriteIdSet.delete(id);
-                favoriteRecords = favoriteRecords.filter(r => r && r.id !== id);
+                favoriteLocalRecords = favoriteLocalRecords.filter(r => r && r.id !== id);
+                if (removed) {
+                    favoriteRecords = favoriteRecords.filter(r => recordGlobalKey(r) !== recordGlobalKey(removed));
+                    crossIndexRemove(removed).catch(() => {});
+                } else {
+                    favoriteRecords = favoriteRecords.filter(r => r && r.id !== id);
+                }
                 favoriteCount = favoriteRecords.length;
                 updateFavCountBadge();
                 updateSiteCollectButtonStates();
@@ -3070,9 +3247,11 @@
             const record = buildFavoriteRecord(data);
             await favPut(record);
             cacheFavoriteAssets(record).catch(() => {});
+            crossIndexUpsert(record).catch(() => {});
             scheduleOfflineSync();
             favoriteIdSet.add(id);
-            favoriteRecords.unshift(record);
+            favoriteLocalRecords.unshift(record);
+            favoriteRecords = [record, ...favoriteRecords.filter(r => recordGlobalKey(r) !== recordGlobalKey(record))];
             favoriteCount = favoriteRecords.length;
             updateFavCountBadge();
             updateSiteCollectButtonStates();
@@ -3141,20 +3320,20 @@
 
     /** 导出收藏到本地文件（优先 File System Access API，降级为下载） */
     async function exportFavorites() {
-        const list = await favGetAll();
+        const list = await collectCrossSiteRecords(await favGetAll());
         if (!list.length) {
             showFavToast('暂无收藏可导出');
             return;
         }
         const d = new Date();
         const pad = n => String(n).padStart(2, '0');
-        const prefix = SITE === 'youtube' ? 'youtube-favorites' : (SITE === 'x' ? 'x-favorites' : FAV_EXPORT_PREFIX);
-        const filename = `${prefix}-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
+        const filename = `${FAV_EXPORT_PREFIX}-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
         const json = JSON.stringify(list, null, 2);
 
-        if (hasFsAccessApi()) {
+        const pickSave = getSaveFilePicker();
+        if (pickSave) {
             try {
-                const handle = await window.showSaveFilePicker({
+                const handle = await pickSave({
                     suggestedName: filename,
                     types: FAV_EXPORT_TYPES,
                 });
@@ -3450,7 +3629,7 @@ ${cards}
 
     /** 导出离线快照：单文件 HTML，无网络也能完整查看收藏内容 */
     async function exportOfflineSnapshot() {
-        const list = await favGetAll();
+        const list = await collectCrossSiteRecords(await favGetAll());
         if (!list.length) {
             showFavToast('暂无收藏可导出');
             return;
@@ -3469,9 +3648,10 @@ ${cards}
             const html = offlinePageHtml(entries, d.toISOString());
 
             let saved = false;
-            if (hasFsAccessApi()) {
+            const pickSaveHtml = getSaveFilePicker();
+            if (pickSaveHtml) {
                 try {
-                    const handle = await window.showSaveFilePicker({
+                    const handle = await pickSaveHtml({
                         suggestedName: filename,
                         types: FAV_OFFLINE_TYPES,
                     });
@@ -3529,7 +3709,7 @@ ${cards}
                 <div class="be-fav-toolbar">
                     <div class="be-fav-search">
                         ${FAV_ICONS.search}
-                        <input type="search" id="be-fav-search" placeholder="搜索视频或评论" autocomplete="off" />
+                        <input type="search" id="be-fav-search" placeholder="搜索全部收藏" autocomplete="off" />
                     </div>
                 </div>
                 <div id="be-fav-list" class="be-fav-list"></div>
@@ -3698,6 +3878,8 @@ ${cards}
                 ? `<a class="be-fav-video-thumb" href="${escapeHtml(page)}" target="_blank" rel="noopener noreferrer" aria-label="打开${kindLabel}">${thumbInner}${durationTag}</a>`
                 : `<div class="be-fav-video-thumb">${thumbInner}${durationTag}</div>`)
             : '';
+        const isLocalRecord = site === SITE;
+        const delTitle = isLocalRecord ? '删除收藏' : '从列表移除（不删除源站点数据）';
         const itemClass = 'be-fav-item be-fav-video-item' + (isPost && !cover ? ' be-fav-video-item--text' : '');
         const titleEl = page
             ? `<a class="be-fav-video-title" href="${escapeHtml(page)}" target="_blank" rel="noopener noreferrer">${escapeHtml(title)}</a>`
@@ -3718,7 +3900,7 @@ ${cards}
                         <span>发布于 ${escapeHtml(publishedAt)}</span>
                     </div>
                 </div>
-                <button type="button" class="be-fav-del" data-id="${id}" title="删除收藏" aria-label="删除收藏">${FAV_ICONS.trash}</button>
+                <button type="button" class="be-fav-del" data-id="${id}" title="${escapeHtml(delTitle)}" aria-label="${escapeHtml(delTitle)}">${FAV_ICONS.trash}</button>
             </div>
             <div class="be-fav-item-foot">
                 <span class="be-fav-saved">收藏于 ${escapeHtml(savedAt)}</span>
@@ -3747,6 +3929,8 @@ ${cards}
         const openLink = page
             ? `<a class="be-fav-original-link" href="${escapeHtml(page)}" target="_blank" rel="noopener noreferrer">打开原评论 ${FAV_ICONS.open}</a>`
             : '';
+        const isLocalRecord = site === SITE;
+        const delTitle = isLocalRecord ? '删除收藏' : '从列表移除（不删除源站点数据）';
 
         return `<article class="be-fav-item" data-id="${id}">
             <div class="be-fav-item-head">
@@ -3759,7 +3943,7 @@ ${cards}
                         ${ipTag}
                     </div>
                 </div>
-                <button type="button" class="be-fav-del" data-id="${id}" title="删除收藏" aria-label="删除收藏">${FAV_ICONS.trash}</button>
+                <button type="button" class="be-fav-del" data-id="${id}" title="${escapeHtml(delTitle)}" aria-label="${escapeHtml(delTitle)}">${FAV_ICONS.trash}</button>
             </div>
             <p class="be-fav-item-content">${content}</p>
             <div class="be-fav-item-foot">
@@ -3775,7 +3959,11 @@ ${cards}
         const countPill = overlay.querySelector('#be-fav-count-pill');
         const query = favSearchQuery.trim().toLowerCase();
         const filtered = query
-            ? favoriteRecords.filter(r => `${r.uname || ''}\n${r.content || ''}\n${r.bvid || ''}\n${r.page || ''}\n${r.site || ''}`.toLowerCase().includes(query))
+            ? favoriteRecords.filter((r) => {
+                const siteLabel = SITE_LABELS[r.site] || r.site || '';
+                return `${r.uname || ''}\n${r.content || ''}\n${r.bvid || ''}\n${r.page || ''}\n${siteLabel}`
+                    .toLowerCase().includes(query);
+            })
             : favoriteRecords;
 
         countPill.textContent = String(favoriteCount);
@@ -3825,10 +4013,32 @@ ${cards}
 
     async function removeFavorite(id) {
         if (!id) return;
+        const target = favoriteRecords.find(r => r && r.id === id) || null;
+        const targetSite = target ? (target.site || 'bilibili') : SITE;
         try {
+            if (target && targetSite !== SITE) {
+                // 外站记录：本站没有它的原始数据，只从跨站索引移除（留墓碑，避免再次同步回来）
+                await crossIndexRemove(target);
+                favoriteRecords = favoriteRecords.filter(r => recordGlobalKey(r) !== recordGlobalKey(target));
+                favoriteCount = favoriteRecords.length;
+                updateFavCountBadge();
+                updateVideoFavoriteMenuItem();
+                renderFavoritesList();
+                scheduleOfflineSync();
+                showFavToast('已从列表移除');
+                return;
+            }
+
+            const removed = favoriteLocalRecords.find(r => r && r.id === id) || target;
             await favDelete(id);
             favoriteIdSet.delete(id);
-            favoriteRecords = favoriteRecords.filter(r => r && r.id !== id);
+            favoriteLocalRecords = favoriteLocalRecords.filter(r => r && r.id !== id);
+            if (removed) {
+                favoriteRecords = favoriteRecords.filter(r => recordGlobalKey(r) !== recordGlobalKey(removed));
+                crossIndexRemove(removed).catch(() => {});
+            } else {
+                favoriteRecords = favoriteRecords.filter(r => r && r.id !== id);
+            }
             favoriteCount = favoriteRecords.length;
             updateFavCountBadge();
             updateVideoFavoriteMenuItem();
@@ -4043,9 +4253,16 @@ ${cards}
 
         try {
             if (favoriteIdSet.has(record.id)) {
+                const removed = favoriteLocalRecords.find(r => r && r.id === record.id);
                 await favDelete(record.id);
                 favoriteIdSet.delete(record.id);
-                favoriteRecords = favoriteRecords.filter(r => r && r.id !== record.id);
+                favoriteLocalRecords = favoriteLocalRecords.filter(r => r && r.id !== record.id);
+                if (removed) {
+                    favoriteRecords = favoriteRecords.filter(r => recordGlobalKey(r) !== recordGlobalKey(removed));
+                    crossIndexRemove(removed).catch(() => {});
+                } else {
+                    favoriteRecords = favoriteRecords.filter(r => r && r.id !== record.id);
+                }
                 favoriteCount = favoriteRecords.length;
                 updateFavCountBadge();
                 updateSiteCollectButtonStates();
@@ -4056,10 +4273,12 @@ ${cards}
 
             await favPut(record);
             cacheFavoriteAssets(record).catch(() => {});
+            crossIndexUpsert(record).catch(() => {});
             scheduleOfflineSync();
             favoriteIdSet.add(record.id);
-            favoriteRecords = favoriteRecords.filter(r => r && r.id !== record.id);
-            favoriteRecords.unshift(record);
+            favoriteLocalRecords = favoriteLocalRecords.filter(r => r && r.id !== record.id);
+            favoriteLocalRecords.unshift(record);
+            favoriteRecords = [record, ...favoriteRecords.filter(r => recordGlobalKey(r) !== recordGlobalKey(record))];
             favoriteCount = favoriteRecords.length;
             updateFavCountBadge();
             updateSiteCollectButtonStates();

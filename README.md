@@ -15,8 +15,16 @@
 - **YouTube**：收藏视频（操作栏按钮 / 悬浮菜单）和评论
 - **X / Twitter**：收藏推文 / 回复（每条推文操作栏按钮，收藏页推文可从悬浮菜单）
 - **悬浮球**：右下角悬浮球可拖拽；靠近左右边缘自动半隐藏，hover 展开菜单；位置持久化到 `localStorage`
-- **收藏面板**：毛玻璃 UI，支持搜索、混合展示视频卡片与评论记录、打开原内容、单条删除、导出 JSON
+- **收藏面板**：毛玻璃 UI，支持跨站搜索、混合展示视频卡片与评论记录、打开原内容、单条删除、导出 JSON
 - **主题自适应**：深色 / 浅色自动切换毛玻璃配色
+
+### 跨站收藏夹
+- **一处看全部**：任意站点（B站 / YouTube / X）打开收藏面板，都能看到**所有站点**的收藏，卡片带站点标签
+- **跨站搜索**：搜标题、评论正文、作者、BV 号，也可以直接搜站点名（`b站` / `youtube` / `x`）
+- **收藏数徽标**也是全站合计
+- 跨站记录走油猴存储（`GM_getValue` / `GM_setValue`），因此升级后 Tampermonkey 会请求一次存储权限
+- **删除语义**：本站记录 = 真删除；外站记录 = 从统一列表移除（不碰源站点数据，并留墓碑防止它再同步回来）
+- 未授权 GM 存储时自动降级为单站模式，功能不受影响
 
 ### 离线访问（飞机 / 临时断网）
 油猴脚本依赖网站页面运行：断网时站点本身打不开，脚本也不会执行。因此离线入口必须独立于网页。
@@ -34,7 +42,7 @@
 - 浏览器不支持目录访问（Safari / Firefox）时，离线按钮自动降级为单文件下载
 
 ### 站点支持
-- Bilibili：`www.bilibili.com`、`t.bilibili.com`、`space.bilibili.com`、`search.bilibili.com`
+- Bilibili：**所有子域**（`www` / `t` / `space` / `search` / `live` / `passport` / `message` …）任意页面都能打开收藏夹
 - YouTube：`www.youtube.com`、`m.youtube.com`
 - X：`x.com`、`twitter.com`
 
@@ -56,10 +64,11 @@
 
 ## 技术要点
 
-- 纯前端，`@grant none`，`document-end` 注入
+- 纯前端，`document-end` 注入；使用 `GM_getValue` / `GM_setValue` 做跨站存储，其余能力（IndexedDB / File System Access）在 GM 沙箱下用 `unsafeWindow` 兜底
 - **站点适配层**：B站走 Shadow DOM 评论区；YouTube 走 `ytd-comment-*` / `#top-level-buttons-computed`；X 走 `article[data-testid="tweet"]` 与 `[role="group"]`
 - **存储**：每个站点使用各自 origin 的 IndexedDB，`favorites` 存记录（keyPath=id）、`assets` 存图片 Blob（keyPath=url）、`mirror` 存子域离线镜像
-  - B 站子域之间通过隐藏的 `www.bilibili.com/404` iframe + `postMessage` 桥接共享同一份收藏
+  - B 站**任意子域**之间通过隐藏的 `www.bilibili.com/404` iframe + `postMessage` 桥接共享同一份收藏
+  - 跨站索引存在油猴存储里（只存文本记录），图片仍按 origin 缓存在各自 IndexedDB
   - 资源缓存在各 origin 本地，打开面板时后台补齐缺失图片；总量超限按写入时间淘汰最旧资源
   - YouTube / X 目前为站点独立收藏夹；跨站统一收藏需要改用油猴 `GM_setValue` 存储
 - 悬浮球使用 Pointer Events 拖拽、边缘吸附与半隐藏
