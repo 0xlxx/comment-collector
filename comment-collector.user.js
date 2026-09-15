@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Comment Collector - 评论收藏增强
 // @namespace    comment-collector
-// @version      3.2.2
+// @version      3.2.3
 // @description  在 B站 / YouTube / X 收藏视频、推文与评论，B站额外显示 IP 属地与粉丝数
 // @author       biliip
 // @updateURL   https://raw.githubusercontent.com/0xlxx/comment-collector/main/comment-collector.user.js
@@ -1696,7 +1696,7 @@
     const FAV_MIRROR_STORE = 'mirror';           // keyPath: key（www 收藏的离线镜像）
     const FAV_HANDLE_STORE = 'handles';          // keyPath: key（离线副本目录句柄）
     const FAV_DB_VERSION = 4;
-    const FAV_DB_BLOCKED_BACKOFF = 20000;      // 被其它标签页占用时，多久内不再重试
+    const FAV_DB_BLOCKED_BACKOFF = 6000;       // 被其它标签页占用时，多久内不再重试（关掉旧标签页后能尽快恢复）
     const OFFLINE_DIR_KEY = 'offline-dir';
     const OFFLINE_BUNDLE_NAME = 'comment-collector-offline';
     const FAV_ASSET_MAX_BYTES = 6 * 1024 * 1024;         // 单张图片上限
