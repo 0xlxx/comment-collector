@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Comment Collector - 评论收藏增强
 // @namespace    comment-collector
-// @version      3.2.0
+// @version      3.2.1
 // @description  在 B站 / YouTube / X 收藏视频、推文与评论，B站额外显示 IP 属地与粉丝数
 // @author       biliip
 // @updateURL   https://raw.githubusercontent.com/0xlxx/comment-collector/main/comment-collector.user.js
@@ -3906,15 +3906,20 @@ ${cards}
             e.stopPropagation();
             if (btn.disabled) return;
             btn.disabled = true;
-            const res = await toggleFavorite(data);
-            btn.disabled = false;
-            if (res.ok) {
-                setFavButtonState(btn, res.action === 'added');
-                showFavToast(res.action === 'added' ? '已收藏' : '已取消收藏');
-            } else if (res.error === 'no-file') {
-                showFavToast('此浏览器不支持文件系统保存');
-            } else {
-                showFavToast('收藏失败：' + res.error);
+            try {
+                const res = await toggleFavorite(data);
+                if (res.ok) {
+                    setFavButtonState(btn, res.action === 'added');
+                    showFavToast(res.action === 'added' ? '已收藏' : '已取消收藏');
+                } else if (res.error === 'no-file') {
+                    showFavToast('此浏览器不支持文件系统保存');
+                } else {
+                    showFavToast('收藏失败：' + res.error);
+                }
+            } catch (err) {
+                showFavToast('收藏失败：' + ((err && err.message) || err));
+            } finally {
+                btn.disabled = false;
             }
         });
 
@@ -4028,7 +4033,9 @@ ${cards}
         }
         if (SITE === 'x') {
             const ref = getXPrimaryRef();
-            return ref ? { id: ref.id, site: 'x', type: 'post', ref } : null;
+            // getXPrimaryRef 返回 { id, statusId, ref: article }，这里要取内层的 article，
+            // 否则 extractXTweetRecord 会拿到普通对象并抛错。
+            return ref ? { id: ref.id, site: 'x', type: 'post', ref: ref.ref } : null;
         }
         return null;
     }
@@ -4098,11 +4105,16 @@ ${cards}
                 e.stopPropagation();
                 if (btn.disabled) return;
                 btn.disabled = true;
-                const res = await togglePrimaryFavorite();
-                btn.disabled = false;
-                updateSiteCollectButtonStates();
-                if (res.ok) showFavToast(res.action === 'added' ? '已收藏视频' : '已取消收藏视频');
-                else showFavToast('视频收藏失败：' + res.error);
+                try {
+                    const res = await togglePrimaryFavorite();
+                    updateSiteCollectButtonStates();
+                    if (res.ok) showFavToast(res.action === 'added' ? '已收藏' : '已取消收藏');
+                    else showFavToast('收藏失败：' + res.error);
+                } catch (err) {
+                    showFavToast('收藏失败：' + ((err && err.message) || err));
+                } finally {
+                    btn.disabled = false;
+                }
             });
 
             const share = toolbar.querySelector('.share, .share-btn-outer') ||
@@ -4238,11 +4250,16 @@ ${cards}
                 e.stopPropagation();
                 if (btn.disabled) return;
                 btn.disabled = true;
-                const res = await togglePrimaryFavorite();
-                btn.disabled = false;
-                updateSiteCollectButtonStates();
-                if (res.ok) showFavToast(res.action === 'added' ? '已收藏视频' : '已取消收藏视频');
-                else showFavToast('视频收藏失败：' + res.error);
+                try {
+                    const res = await togglePrimaryFavorite();
+                    updateSiteCollectButtonStates();
+                    if (res.ok) showFavToast(res.action === 'added' ? '已收藏' : '已取消收藏');
+                    else showFavToast('收藏失败：' + res.error);
+                } catch (err) {
+                    showFavToast('收藏失败：' + ((err && err.message) || err));
+                } finally {
+                    btn.disabled = false;
+                }
             });
             bar.appendChild(btn);
         }
@@ -4302,11 +4319,16 @@ ${cards}
             e.stopPropagation();
             if (btn.disabled) return;
             btn.disabled = true;
-            const res = await toggleRecordById(extractYoutubeComment(el));
-            btn.disabled = false;
-            updateSiteCollectButtonStates();
-            if (res.ok) showFavToast(res.action === 'added' ? '已收藏评论' : '已取消收藏评论');
-            else showFavToast('评论收藏失败：' + res.error);
+            try {
+                const res = await toggleRecordById(extractYoutubeComment(el));
+                updateSiteCollectButtonStates();
+                if (res.ok) showFavToast(res.action === 'added' ? '已收藏评论' : '已取消收藏评论');
+                else showFavToast('评论收藏失败：' + res.error);
+            } catch (err) {
+                showFavToast('评论收藏失败：' + ((err && err.message) || err));
+            } finally {
+                btn.disabled = false;
+            }
         });
 
         const reply = actionBar.querySelector('#reply-button-end, ytd-button-renderer#reply-button-end, #reply-button');
@@ -4384,10 +4406,14 @@ ${cards}
     }
 
     function getXPrimaryRef() {
-        if (!/\/status\/\d+/.test(location.pathname)) return null;
-        const article = document.querySelector('article[data-testid="tweet"]');
-        const statusId = getXTweetId(article);
-        return statusId ? { id: 'x:' + statusId, statusId, site: 'x', type: 'post', ref: article } : null;
+        const match = location.pathname.match(/\/status\/(\d+)/);
+        if (!match) return null;
+        const statusId = match[1];
+        // 详情页会同时渲染"被回复的上下文推文"，DOM 里的第一个 article 未必是当前这条，
+        // 因此以 URL 的 status id 为准，并且只接受 id 对得上的 article（内容和 id 必须同源）。
+        const article = [...document.querySelectorAll('article[data-testid="tweet"]')]
+            .find(a => getXTweetId(a) === statusId);
+        return article ? { id: 'x:' + statusId, statusId, site: 'x', type: 'post', ref: article } : null;
     }
 
     function ensureXTweetCollectButton(article) {
@@ -4411,12 +4437,17 @@ ${cards}
             e.stopPropagation();
             if (btn.disabled) return;
             btn.disabled = true;
-            const latest = extractXTweetRecord(article) || record;
-            const res = await toggleRecordById(latest);
-            btn.disabled = false;
-            updateSiteCollectButtonStates();
-            if (res.ok) showFavToast(res.action === 'added' ? '已收藏推文' : '已取消收藏推文');
-            else showFavToast('推文收藏失败：' + res.error);
+            try {
+                const latest = extractXTweetRecord(article) || record;
+                const res = await toggleRecordById(latest);
+                updateSiteCollectButtonStates();
+                if (res.ok) showFavToast(res.action === 'added' ? '已收藏推文' : '已取消收藏推文');
+                else showFavToast('推文收藏失败：' + res.error);
+            } catch (err) {
+                showFavToast('推文收藏失败：' + ((err && err.message) || err));
+            } finally {
+                btn.disabled = false;
+            }
         });
         group.appendChild(btn);
         setSiteCollectButtonState(btn, favoriteIdSet.has(record.id));
@@ -4707,15 +4738,20 @@ ${cards}
         wrap.querySelector('#be-fab-video-fav').addEventListener('click', async function () {
             if (this.disabled) return;
             this.disabled = true;
-            const res = await toggleCurrentVideoFavorite();
-            this.disabled = false;
-            updateVideoFavoriteMenuItem();
-            if (res.ok) {
-                showFavToast(res.action === 'added' ? '已收藏视频' : '已取消收藏视频');
-            } else if (res.error === 'not-video') {
-                showFavToast('当前页面没有可收藏的视频');
-            } else {
-                showFavToast('视频收藏失败：' + res.error);
+            try {
+                const res = await toggleCurrentVideoFavorite();
+                updateVideoFavoriteMenuItem();
+                if (res.ok) {
+                    showFavToast(res.action === 'added' ? '已收藏' : '已取消收藏');
+                } else if (res.error === 'not-collectable') {
+                    showFavToast('当前页面没有可收藏的内容');
+                } else {
+                    showFavToast('收藏失败：' + res.error);
+                }
+            } catch (e) {
+                showFavToast('收藏失败：' + ((e && e.message) || e));
+            } finally {
+                this.disabled = false;
             }
         });
         wrap.querySelector('#be-fab-favorites').addEventListener('click', () => {
