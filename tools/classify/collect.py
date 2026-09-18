@@ -55,9 +55,40 @@ def load_plugin_json(path: Path) -> list[Item]:
             parts.append(title)
         if uname:
             parts.append(uname)
+        if len(" ".join(parts)) < 4:          # 全空才用 URL 兜底
+            parts.append(url_hint(page))
         out.append(Item(text=" ｜ ".join(parts), title=content or title, url=page,
                         source=_site_of(page), kind="comment" if content else "video", meta=it))
     return out
+
+
+_URL_NOISE = {"https", "http", "www", "com", "cn", "org", "net", "io", "html", "htm",
+              "index", "en", "zh", "docs", "doc", "blog", "article", "post", "watch",
+              "video", "zh-cn", "latest", "main", "current"}
+
+
+def url_hint(url: str, max_words: int = 8) -> str:
+    """从 URL 路径里抠出有信息量的 slug 词。
+
+    只在标题为空/过短时兜底——把 URL 直接拼进正文会**污染 embedding**：
+    所有条目共享 https/www/com 这类词，均值池化后把向量拉向同一个方向，
+    实测会把 4 个主题簇压成 2 个大杂烩（见 results/REPORT.md §3.3）。
+    """
+    if not url:
+        return ""
+    path = re.sub(r"^[a-z]+://", "", url.lower())
+    path = path.split("?", 1)[0].split("#", 1)[0]
+    parts = re.split(r"[/_.\-]+", path)
+    words = []
+    for w in parts:
+        if not w or w in _URL_NOISE or w.isdigit() or len(w) < 3:
+            continue
+        if len(w) < 2 or w in words:
+            continue
+        words.append(w)
+        if len(words) >= max_words:
+            break
+    return " ".join(words)
 
 
 def _site_of(url: str) -> str:
@@ -121,7 +152,8 @@ def load_bookmarks_html(path: Path) -> list[Item]:
         href = href.replace("&amp;", "&")
         if not title and not href:
             continue
-        out.append(Item(text=_clean(f"{title} {href}"), title=title, url=href,
+        body = title if len(title) >= 4 else _clean(f"{title} {url_hint(href)}")
+        out.append(Item(text=body, title=title or href, url=href,
                         source=_site_of(href), kind="bookmark"))
     return out
 
@@ -140,8 +172,11 @@ def load_jsonl(path: Path) -> list[Item]:
         title = _clean(d.get("title") or d.get("text") or "")
         extra = _clean(d.get("text") or "")
         url = d.get("url") or ""
-        out.append(Item(text=_clean(f"{title} {extra if extra != title else ''}"), title=title,
-                        url=url, source=d.get("source") or _site_of(url), kind=d.get("kind") or "", meta=d))
+        body = _clean(f"{title} {extra if extra != title else ''}").strip()
+        if len(body) < 4:                      # 只有裸 URL 的书签，才从 slug 里取词
+            body = url_hint(url)
+        out.append(Item(text=body, title=title or url_hint(url), url=url,
+                        source=d.get("source") or _site_of(url), kind=d.get("kind") or "", meta=d))
     return out
 
 

@@ -14,6 +14,8 @@
 | 聚类 | **UMAP(5~10 维) + HDBSCAN** | 不用预先知道分几类，自动定簇 + 天然留出「未归类」 |
 | 起名 | **本地 LLM（Qwen3-4B-4bit / MLX）** | 「社会观察」「地缘政治」这种名字只有 LLM 给得出来 |
 | 起名兜底 | c-TF-IDF 关键词 | 零成本、离线，但抽象主题会起成「小学生·多少·不是」 |
+| 喂给模型的文本 | **只用标题**，URL 不参与 | 拼 href 会把 6 个主题压成 2 个大杂烩（§3.3） |
+| 超参 | 按 n 自动缩放；n<50 单独分支 | 同一套参数不可能通吃 n=20 和 n=2000（§3.4） |
 
 **一句话结论：瓶颈不在模型大小，在「怎么把一堆向量变成一个人类看得懂的类名」。**
 
@@ -151,6 +153,83 @@ ritrieve-zh 的 13 个簇（本地 LLM 命名）：
 因为给的分类表里没有「音乐」这个选项。
 **固定分类模式下，分类表漏掉一个类，就会产生系统性错分；聚类模式没有这个问题。**
 
+### 3.2 浏览器书签路径实测（由 Vercel 那条链接触发）
+
+拿一条真实链接做端到端测试：
+
+`https://vercel.com/changelog/typesafe-ai-jev-now-available-on-ai-gateway`
+—— Vercel changelog，TypeSafe AI 的 **Jev** 概率决策模型上线 AI Gateway：
+「state 进去，typed Choice / Score / Boolean 出来」，AI SDK 7 通过 `experimental_evaluate` 调用，
+官方称比 LLM 快 193.6x、便宜 444.6x。（页面抓取用 `crwl`，12KB markdown）
+
+为了有对照，造了一份 20 条真实风格的书签导出（AI 工具 5 / 算法 3 / 编程 3 / 数据库 2 / 硬件 2 / 生活 5，共 **6 组**），
+走 Chrome 书签 HTML 解析路径。
+
+| 输入构造 | 簇数 | 覆盖率 | ARI（对 6 组人工标注） |
+|---|---|---|---|
+| 标题 + 完整 URL（**修复前**） | 2 | 85% | 0.087 |
+| 仅标题（**修复后**） | 4 | 75% | **0.457** |
+
+修复前的两个"簇"长这样——典型的**大杂烩**：
+
+```
+[AI 工具] 10 条   ← HDBSCAN 文档 / UMAP / BERTopic / Rust 所有权 / TypeScript 5.7 / …
+[理财规划]  7 条   ← 苹果 M4 Pro 评测 / 京都三日游 / 减脂餐 / 房贷 / Spring Boot 3 / …
+```
+
+### 3.3 根因：URL 会污染 embedding
+
+`collect.py` 原来把书签拼成 `title + " " + href` 再喂给模型。问题是：
+
+- 所有条目共享 `https` / `www` / `com` 这类 token，**不带来任何区分度**；
+- 但 sentence-transformers 用的是 **mean pooling**（对所有 token 向量取平均），
+  这些共同 token 把每条向量都往同一个方向拉，**压缩了条目之间的差异**；
+- 相似度因此普遍升高，HDBSCAN 判定"大家都差不多"，于是合并成大簇。
+
+修复：**embedding 只吃标题**；标题为空或过短（< 4 字符）时才从 URL 路径里抠 slug 词兜底。
+
+```
+https://vercel.com/changelog/typesafe-ai-jev-now-available-on-ai-gateway
+  → "vercel changelog typesafe jev now available gateway"      ← 兜底文本
+https://www.postgresql.org/docs/current/indexes.html
+  → "postgresql indexes"                                        ← 兜底文本
+```
+
+### 3.4 参数标定：小语料必须单独处理
+
+同一套默认参数不可能在 n=20 和 n=2000 上都对。实测：
+
+| 语料 | 修复前 | 修复后 |
+|---|---|---|
+| n=20 书签（6 组） | k=2，覆盖 80%，**ARI 0.087** | k=4，覆盖 75%，**ARI 0.457** |
+| n=150 B 站标题 | k=13，覆盖 86% | k=14，覆盖 79% |
+| n=2000 TNews（15 类） | k=25，覆盖 74%，ARI 0.274 | k=14，覆盖 74%，**ARI 0.330** |
+
+两条修正：
+
+1. **`min_cluster_size` 不能设上限。** 原实现 `clip(n/50, 3, 20)` 把 n=2000 该用的 40 截成了 20，
+   ARI 掉 0.056。改成 `max(2, round(n/50))`，不封顶。
+2. **n < 50 要降 `min_samples` 并放宽 UMAP 邻域。** 原来 `min_samples=3` + `n_neighbors=5`
+   在 20 条上把点要么全判成噪声、要么合并成 1~2 簇。改成 `min_samples=2`、`n_neighbors=min(n-1, 15)`。
+
+落地为 `classify.py` 的 `auto_params()`：
+
+```python
+mcs = max(2, round(n / 50))          # 不封顶：n=2000 → 40
+if n < 50:                            # 小语料单独分支
+    n_neighbors, min_samples = min(n - 1, 15), 2
+else:
+    n_neighbors, min_samples = clip(round(n / 10), 5, 30), 3
+```
+
+### 3.5 规模边界
+
+| 规模 | 结果 |
+|---|---|
+| **n < 10** | **聚类无意义**，实测恒为 0 簇（4 个点做 5 维 UMAP，结构全丢）→ 工具会提示改用 `--taxonomy` |
+| n ≈ 20~50 | 出 3~5 个簇，覆盖率约 75%，其余进「未归类」 |
+| n ≥ 100 | 配方进入设计工作区，k 能自动逼近真实类别数（n=2000 时给出 14 簇 vs 真实 15 类） |
+
 ---
 
 ## 4. 起名方案对比
@@ -281,6 +360,10 @@ ls ~/Library/Messages                            → Operation not permitted
    要么给全分类表，要么用聚类自动发现。
 10. **小语料下模型加载时间会盖过推理时间。** 150 条跑 13 秒，其中大部分是加载 0.3B 权重。
     批量任务一次加载、多次复用才划算。
+11. **URL 会污染 embedding。** 把 href 拼进正文后，20 条书签的 6 个主题被压成 2 个大杂烩，
+    ARI 0.087；去掉 URL 只留标题，ARI 升到 0.457。共同 token 通过 mean pooling 把向量拉齐了。
+12. **同一套超参不可能通吃。** n=20 与 n=2000 的最优 `min_samples` 差一倍，
+    `min_cluster_size` 的最优缩放还带上限陷阱——必须按规模分支。
 
 ---
 
@@ -294,6 +377,8 @@ ls ~/Library/Messages                            → Operation not permitted
 | 4 | 是否把 bge-small-zh ONNX + Transformers.js 搬进 userscript | 待质量验证后定 |
 | 5 | CLS（内容布局偏移）与毛玻璃面板的稳定性 | 独立 UI 任务，与本报告无关 |
 | 6 | 增量分类：新增收藏时不重跑全量 | 设计问题（可用「分配最近簇质心」实现增量） |
+| 7 | 书签只有标题可用，标题起得烂就分不准 | 可考虑抓页面正文/摘要补进 embedding（`crwl` 已可用） |
+| 8 | 真实 Chrome 书签导出尚未跑过（只有造的 20 条） | 等用户导出 `Bookmarks.html` |
 
 ---
 
@@ -319,6 +404,9 @@ curl -sSL -o data/tnews_valid.parquet \
 # §3 / §4（端到端 + 起名）
 .venv/bin/python classify.py data/bili_mixed.jsonl -o out --model ritrieve-zh --name
 
+# §3.2~§3.4 的回归测试（不需要模型）
+.venv/bin/python test_collect.py
+
 # §3.1（固定分类零样本）
 .venv/bin/python classify.py ~/Downloads/bilibili-favorites.json -o out \
     --model ritrieve-zh --taxonomy "AI与科技,游戏,学习,生活,影视"
@@ -336,6 +424,8 @@ curl -sSL -o data/tnews_valid.parquet \
 | `labeling.py` | c-TF-IDF 关键词标签（无 LLM 兜底） |
 | `llm.py` | 本地 MLX 大模型：簇命名 / 零样本归类 |
 | `fetch_public_corpus.py` | 抓公开基准语料（B 站热门 + 分区排行），无个人数据 |
+| `test_collect.py` | 回归测试：`§3.2/§3.3` 的 URL 污染 bug 不许复发（无需模型） |
+| `fixtures/bookmarks_sample.html` | 20 条书签导出样本（6 组主题），回归测试基准 |
 
 ## 附录 C · 环境与依赖
 

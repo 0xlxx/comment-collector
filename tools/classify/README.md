@@ -44,6 +44,14 @@ uv pip install --python .venv/bin/python -r requirements.txt
 | `labeling.py` | c-TF-IDF 关键词标签（无 LLM 兜底） |
 | `llm.py` | 本地 MLX 大模型：簇命名 / 零样本归类 |
 | `fetch_public_corpus.py` | 抓公开基准语料（B 站热门 + 分区排行），用于验证效果 |
+| `test_collect.py` | 回归测试：解析 + URL 处理（不需要模型，秒级） |
+| `fixtures/bookmarks_sample.html` | 20 条书签导出样本，供回归测试用 |
+
+## 测试
+
+```bash
+.venv/bin/python test_collect.py
+```
 
 ## 结论
 

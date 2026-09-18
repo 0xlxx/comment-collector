@@ -22,19 +22,37 @@ from collect import Item, load_corpus
 
 
 # ---------------------------------------------------------------- 聚类
-def cluster(X: np.ndarray, min_cluster_size: int | None = None, min_samples: int = 3,
+def auto_params(n: int, n_components: int = 5) -> dict:
+    """按语料规模自动定超参。
+
+    两条经验规律（都来自实测，见 results/REPORT.md §3.2）：
+      - min_cluster_size ≈ n/50，**不设上限**（n=2000 时 40 明显优于被截到 20）
+      - n < 50 时必须单独处理：邻域放宽到 ~n、min_samples 降到 2，
+        否则 UMAP+HDBSCAN 会塌成 1~2 个大簇，颗粒度全丢
+    """
+    mcs = max(2, round(n / 50))
+    if n < 50:
+        return dict(n_components=int(np.clip(n_components, 2, max(2, n - 2))),
+                    n_neighbors=int(max(3, min(n - 1, 15))),
+                    min_cluster_size=mcs, min_samples=2)
+    return dict(n_components=int(np.clip(n_components, 2, max(2, n - 2))),
+                n_neighbors=int(np.clip(round(n / 10), 5, 30)),
+                min_cluster_size=mcs, min_samples=3)
+
+
+def cluster(X: np.ndarray, min_cluster_size: int | None = None, min_samples: int | None = None,
             n_components: int = 5, seed: int = 42) -> np.ndarray:
     import hdbscan
     import umap
 
-    n = len(X)
-    if min_cluster_size is None:
-        min_cluster_size = int(np.clip(round(n / 50), 3, 20))
-    n_neighbors = int(np.clip(n // 15, 5, 30))
-    n_components = int(np.clip(n_components, 2, max(2, n - 2)))
-    Xr = umap.UMAP(n_components=n_components, n_neighbors=n_neighbors, min_dist=0.0,
+    p = auto_params(len(X), n_components)
+    if min_cluster_size is not None:
+        p["min_cluster_size"] = min_cluster_size
+    if min_samples is not None:
+        p["min_samples"] = min_samples
+    Xr = umap.UMAP(n_components=p["n_components"], n_neighbors=p["n_neighbors"], min_dist=0.0,
                    metric="cosine", random_state=seed).fit_transform(X)
-    return hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples,
+    return hdbscan.HDBSCAN(min_cluster_size=p["min_cluster_size"], min_samples=p["min_samples"],
                            metric="euclidean", cluster_selection_method="eom").fit_predict(Xr)
 
 
@@ -58,7 +76,7 @@ def main() -> None:
     ap.add_argument("-o", "--outdir", default="out")
     ap.add_argument("--model", default="ritrieve-zh", choices=sorted(MODEL_SPECS))
     ap.add_argument("--min-cluster-size", type=int, default=None)
-    ap.add_argument("--min-samples", type=int, default=3)
+    ap.add_argument("--min-samples", type=int, default=None)
     ap.add_argument("--no-umap", action="store_true", help="跳过降维（更纯但覆盖率低）")
     ap.add_argument("--name", action="store_true", help="给簇起名（等价于 --name-method llm）")
     ap.add_argument("--name-method", default="none", choices=["none", "llm", "ctfidf", "both"],
@@ -78,6 +96,9 @@ def main() -> None:
     print(f"[embed] {args.model} dim={X.shape[1]} {time.perf_counter()-t0:.1f}s")
 
     taxonomy = [t.strip() for t in args.taxonomy.split(",") if t.strip()]
+    if not taxonomy and len(items) < 10:
+        print(f"[warn] 只有 {len(items)} 条，聚类在这种规模下没有意义（实测 n<10 恒为 0 簇）。"
+              f"\n       改用固定分类：--taxonomy \"AI工具,游戏,学习,生活,影视\"")
     names: dict[int, str] = {}
     if taxonomy:
         import llm
@@ -93,8 +114,10 @@ def main() -> None:
     else:
         if args.no_umap:
             import hdbscan
-            labels = hdbscan.HDBSCAN(min_cluster_size=args.min_cluster_size or max(3, len(X) // 50),
-                                     min_samples=args.min_samples, metric="euclidean").fit_predict(X)
+            p = auto_params(len(X))
+            labels = hdbscan.HDBSCAN(min_cluster_size=args.min_cluster_size or p["min_cluster_size"],
+                                     min_samples=args.min_samples or p["min_samples"],
+                                     metric="euclidean").fit_predict(X)
         else:
             labels = cluster(X, args.min_cluster_size, args.min_samples)
 
