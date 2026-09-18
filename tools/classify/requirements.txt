@@ -1,0 +1,12 @@
+# Core
+numpy
+scikit-learn
+hdbscan
+# Embeddings
+torch
+transformers
+sentence-transformers
+# Data
+datasets
+# Report
+tabulate

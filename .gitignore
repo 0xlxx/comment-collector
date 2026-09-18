@@ -5,3 +5,10 @@
 *.swp
 *.swo
 *~
+
+# tools/classify 本地环境与产物
+tools/classify/.venv/
+tools/classify/__pycache__/
+tools/classify/cache/
+tools/classify/data/
+tools/classify/out/

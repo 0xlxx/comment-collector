@@ -1,0 +1,122 @@
+{
+  "dataset": "tnews",
+  "n": 4000,
+  "classes": 15,
+  "rows": [
+    {
+      "model": "tfidf",
+      "dim": 20000,
+      "n": 4000,
+      "knn_acc": 0.3275,
+      "logreg_acc": 0.3545,
+      "kmeans": {
+        "n_clusters": 15,
+        "noise_pct": 0.0,
+        "ari": 0.0024,
+        "nmi": 0.0659
+      },
+      "hdbscan": {
+        "n_clusters": 3,
+        "noise_pct": 92.3,
+        "ari": 0.1144,
+        "nmi": 0.2692
+      },
+      "load_s": 1.0,
+      "enc_s": 0.0,
+      "ms_per_1k": 0.0,
+      "peak_rss_mb": 1154.8
+    },
+    {
+      "model": "bge-small-zh",
+      "dim": 512,
+      "n": 4000,
+      "knn_acc": 0.4865,
+      "logreg_acc": 0.504,
+      "kmeans": {
+        "n_clusters": 15,
+        "noise_pct": 0.0,
+        "ari": 0.1761,
+        "nmi": 0.3034
+      },
+      "hdbscan": {
+        "n_clusters": 2,
+        "noise_pct": 84.3,
+        "ari": 0.0326,
+        "nmi": 0.1584
+      },
+      "load_s": 9.2,
+      "enc_s": 2.0,
+      "ms_per_1k": 0.5,
+      "peak_rss_mb": 3076.5
+    },
+    {
+      "model": "e5-small-multi",
+      "dim": 384,
+      "n": 4000,
+      "knn_acc": 0.48,
+      "logreg_acc": 0.524,
+      "kmeans": {
+        "n_clusters": 15,
+        "noise_pct": 0.0,
+        "ari": 0.1272,
+        "nmi": 0.2516
+      },
+      "hdbscan": {
+        "n_clusters": 4,
+        "noise_pct": 94.8,
+        "ari": 0.2228,
+        "nmi": 0.4683
+      },
+      "load_s": 11.1,
+      "enc_s": 1.8,
+      "ms_per_1k": 0.5,
+      "peak_rss_mb": 3076.5
+    },
+    {
+      "model": "ritrieve-zh",
+      "dim": 1792,
+      "n": 4000,
+      "knn_acc": 0.547,
+      "logreg_acc": 0.571,
+      "kmeans": {
+        "n_clusters": 15,
+        "noise_pct": 0.0,
+        "ari": 0.2469,
+        "nmi": 0.3794
+      },
+      "hdbscan": {
+        "n_clusters": 9,
+        "noise_pct": 83.2,
+        "ari": 0.5267,
+        "nmi": 0.7059
+      },
+      "load_s": 10.9,
+      "enc_s": 14.9,
+      "ms_per_1k": 3.7,
+      "peak_rss_mb": 3076.5
+    },
+    {
+      "model": "qwen3-0.6b",
+      "dim": 1024,
+      "n": 4000,
+      "knn_acc": 0.497,
+      "logreg_acc": 0.5245,
+      "kmeans": {
+        "n_clusters": 15,
+        "noise_pct": 0.0,
+        "ari": 0.19,
+        "nmi": 0.32
+      },
+      "hdbscan": {
+        "n_clusters": 5,
+        "noise_pct": 93.0,
+        "ari": 0.4411,
+        "nmi": 0.6171
+      },
+      "load_s": 12.1,
+      "enc_s": 24.1,
+      "ms_per_1k": 6.0,
+      "peak_rss_mb": 3076.5
+    }
+  ]
+}
