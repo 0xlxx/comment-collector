@@ -43,7 +43,11 @@ uv pip install --python .venv/bin/python -r requirements.txt
 | `classify.py` | 端到端主程序 |
 | `labeling.py` | c-TF-IDF 关键词标签（无 LLM 兜底） |
 | `llm.py` | 本地 MLX 大模型：簇命名 / 零样本归类 |
+| `fetch_public_corpus.py` | 抓公开基准语料（B 站热门 + 分区排行），用于验证效果 |
 
 ## 结论
 
-见 [`results/REPORT.md`](results/REPORT.md)。
+完整实测结论、数字、踩坑、未决问题都在 **[`results/REPORT.md`](results/REPORT.md)**（单一事实来源）。
+
+一句话：`ritrieve_zh_v1`（0.3B）+ UMAP + HDBSCAN + 本地 LLM 起名；
+瓶颈不在模型大小，在「怎么把簇变成人类看得懂的名字」。

@@ -90,6 +90,20 @@ B站 支持**所有子域**（`www` / `t` / `space` / `search` / `live` / `passp
 - 导出优先 File System Access API，降级为浏览器下载；离线副本增量写 `index.html` + `assets/`，相对路径在 `file://` 下直接可用
 - 单文件快照完全自包含（无外链资源），按 `prefers-color-scheme` 适配深浅色
 
+## ▣ 收藏自动分类（实验）
+
+`tools/classify/` 是一套离线的收藏整理工具：读入插件导出的 JSON 或浏览器书签 HTML，
+自动聚成主题分类并起中文名（「地缘政治」「原神角色」…）。
+
+```bash
+cd tools/classify && uv venv --python 3.12 .venv \
+  && uv pip install --python .venv/bin/python -r requirements.txt
+.venv/bin/python classify.py ~/Downloads/Bookmarks.html -o out --name
+```
+
+实测结论（模型横评 / 聚类扫描 / 起名对比 / 反直觉发现）见
+**[tools/classify/results/REPORT.md](tools/classify/results/REPORT.md)**。
+
 ## ▣ License
 
 MIT
