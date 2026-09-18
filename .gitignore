@@ -12,3 +12,4 @@ tools/classify/__pycache__/
 tools/classify/cache/
 tools/classify/data/
 tools/classify/out/
+tools/classify/jev/node_modules/
